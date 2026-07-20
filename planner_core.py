@@ -77,7 +77,7 @@ def combine_date_time(date_value, time_value):
 class Database:
     def __init__(self, path):
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.create_schema()
         self.ensure_columns()

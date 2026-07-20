@@ -43,3 +43,10 @@ The included version stores each browser session in an isolated temporary SQLite
 ## Printing
 
 Go to **Machine Slips**, select the date, and download the approved PDF. The PDF groups all operations by Date + Machine + Shift and creates one A4 landscape page per group.
+
+## V2 SQLite thread fix
+
+This build does not cache a live SQLite connection with `st.cache_resource`.
+Each Streamlit rerun opens a new connection to the same session-specific
+SQLite database file. This prevents `sqlite3.ProgrammingError` when Streamlit
+executes a rerun on another thread.

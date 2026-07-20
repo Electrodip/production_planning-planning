@@ -49,8 +49,14 @@ if not check_password():
     st.stop()
 
 
-@st.cache_resource
 def get_database(session_id: str) -> Database:
+    """Open a fresh SQLite connection for each Streamlit rerun.
+
+    Streamlit may execute reruns on different threads. A cached SQLite
+    connection can therefore raise sqlite3.ProgrammingError. The database
+    file remains session-specific, while the connection is created in the
+    current execution thread.
+    """
     db_path = Path(tempfile.gettempdir()) / f"electro_dip_{session_id}.db"
     return Database(db_path)
 
