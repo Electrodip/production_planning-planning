@@ -236,7 +236,7 @@ class Database:
         Returns a report dictionary with record counts and warnings.
         Missing required worksheets remain a fatal error.
         """
-        workbook = load_workbook(file_path, data_only=True)
+        workbook = load_workbook(file_path, data_only=True, read_only=True)
         required = [
             "Customer_Schedules", "Stock_Demand", "Batch_Config", "Process_BOM",
             "Machine_Recommendations", "Machine_Downtime", "Shifts", "Breaks",
@@ -272,6 +272,26 @@ class Database:
         def row_is_blank(row):
             return all(is_blank(value) for value in row)
 
+        def iter_data_rows(ws, min_row=3, blank_row_limit=100):
+            """Yield data rows and stop after a long blank tail.
+
+            This prevents formatted Excel sheets from being interpreted as
+            having hundreds of thousands of records.
+            """
+            consecutive_blank = 0
+            for row_number, row in enumerate(
+                ws.iter_rows(min_row=min_row, values_only=True),
+                start=min_row,
+            ):
+                if row_is_blank(row):
+                    consecutive_blank += 1
+                    report["blank_rows_skipped"] += 1
+                    if consecutive_blank >= blank_row_limit:
+                        break
+                    continue
+                consecutive_blank = 0
+                yield row_number, row
+
         def to_float(value, default=0.0):
             if is_blank(value):
                 return float(default)
@@ -302,12 +322,7 @@ class Database:
 
             # ---------------- Customer Schedules ----------------
             ws = workbook["Customer_Schedules"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
 
                 if is_blank(row[0]) or is_blank(row[1]) or is_blank(row[2]):
                     warn(
@@ -354,12 +369,7 @@ class Database:
 
             # ---------------- Stock Demand ----------------
             ws = workbook["Stock_Demand"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]):
                     warn(ws.title, row_number, "Skipped: Part Name is blank.")
                     continue
@@ -379,12 +389,7 @@ class Database:
 
             # ---------------- Batch Configuration ----------------
             ws = workbook["Batch_Config"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]):
                     warn(ws.title, row_number, "Skipped: Part Name is blank.")
                     continue
@@ -412,12 +417,7 @@ class Database:
 
             # ---------------- Process BOM ----------------
             ws = workbook["Process_BOM"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]) or is_blank(row[2]) or is_blank(row[3]):
                     warn(
                         ws.title, row_number,
@@ -463,12 +463,7 @@ class Database:
 
             # ---------------- Machine Recommendations ----------------
             ws = workbook["Machine_Recommendations"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]) or is_blank(row[1]):
                     warn(
                         ws.title, row_number,
@@ -503,12 +498,7 @@ class Database:
 
             # ---------------- Machine Downtime ----------------
             ws = workbook["Machine_Downtime"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
 
                 # A machine name without dates is a placeholder/master-list row.
                 if not is_blank(row[0]) and all(is_blank(row[i]) for i in (1, 2, 3, 4)):
@@ -556,12 +546,7 @@ class Database:
 
             # ---------------- Shifts ----------------
             ws = workbook["Shifts"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]):
                     warn(ws.title, row_number, "Skipped: Shift Name is blank.")
                     continue
@@ -593,12 +578,7 @@ class Database:
 
             # ---------------- Breaks ----------------
             ws = workbook["Breaks"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]) or is_blank(row[1]):
                     warn(
                         ws.title, row_number,
@@ -633,12 +613,7 @@ class Database:
 
             # ---------------- Holidays ----------------
             ws = workbook["Holidays"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 if is_blank(row[0]):
                     warn(ws.title, row_number, "Skipped: Holiday Date is blank.")
                     continue
@@ -658,12 +633,7 @@ class Database:
 
             # ---------------- Weekly Offs ----------------
             ws = workbook["Weekly_Offs"]
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3
-            ):
-                if row_is_blank(row):
-                    report["blank_rows_skipped"] += 1
-                    continue
+            for row_number, row in iter_data_rows(ws):
                 day_number = to_int(row[0], 0)
                 if day_number < 1 or day_number > 7:
                     warn(
@@ -684,6 +654,7 @@ class Database:
                 )
                 report["counts"]["Weekly Off Rows"] += 1
 
+        workbook.close()
         return report
 
 
@@ -973,6 +944,39 @@ class Database:
                ORDER BY COALESCE(start_datetime, '9999-12-31'), process_sequence"""
         ).fetchall()
 
+    @staticmethod
+    def _db_datetime(value):
+        """Return a datetime for SQLite/Excel values, or None for blank/invalid values."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, time())
+        if isinstance(value, (int, float)):
+            # Excel serial date/time, supported defensively for imported legacy data.
+            try:
+                return datetime(1899, 12, 30) + timedelta(days=float(value))
+            except (TypeError, ValueError, OverflowError):
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("T", " ").replace("Z", "")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                "%d-%b-%Y %H:%M", "%d/%m/%Y %H:%M",
+                "%d-%m-%Y %H:%M",
+            ):
+                try:
+                    return datetime.strptime(text, fmt)
+                except ValueError:
+                    continue
+        return None
+
     def todays_slips(self, selected_date):
         selected_date = parse_date(selected_date)
         rows = []
@@ -982,10 +986,16 @@ class Database:
                LEFT JOIN customer_schedules s
                  ON p.schedule_id = s.schedule_id
                WHERE p.process_type = 'INHOUSE'
+                 AND p.start_datetime IS NOT NULL
+                 AND TRIM(p.start_datetime) <> ''
+                 AND p.end_datetime IS NOT NULL
+                 AND TRIM(p.end_datetime) <> ''
                ORDER BY p.machine_name, p.shift_name, p.start_datetime"""
         ):
-            start = datetime.fromisoformat(row["start_datetime"])
-            end = datetime.fromisoformat(row["end_datetime"])
+            start = self._db_datetime(row["start_datetime"])
+            end = self._db_datetime(row["end_datetime"])
+            if start is None or end is None:
+                continue
             if start.date() <= selected_date <= end.date():
                 rows.append(row)
         return rows
