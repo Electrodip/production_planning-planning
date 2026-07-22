@@ -50,3 +50,13 @@ This build does not cache a live SQLite connection with `st.cache_resource`.
 Each Streamlit rerun opens a new connection to the same session-specific
 SQLite database file. This prevents `sqlite3.ProgrammingError` when Streamlit
 executes a rerun on another thread.
+
+
+## Operator production feedback (V5)
+
+- Operators can enter Actual Qty, Rejected Qty, Status, Operator, Supervisor and Remarks in Machine Slips.
+- Good Qty = Actual Qty - Rejected Qty.
+- Updates are stored separately and are not erased when the plan is regenerated.
+- The next planning run deducts cumulative good quantity reported at the last in-house process.
+- Intermediate-operation output is retained as progress but is not double-counted against customer demand.
+- A Production Progress tab provides the complete update history and CSV download.

@@ -209,6 +209,27 @@ class Database:
             due_datetime TEXT,
             note TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS production_updates (
+            plan_id TEXT PRIMARY KEY,
+            schedule_id TEXT NOT NULL,
+            customer_name TEXT DEFAULT '',
+            part_name TEXT NOT NULL,
+            operation_name TEXT NOT NULL,
+            process_sequence INTEGER NOT NULL,
+            machine_name TEXT DEFAULT '',
+            shift_name TEXT DEFAULT '',
+            report_date TEXT NOT NULL,
+            planned_qty REAL NOT NULL DEFAULT 0,
+            actual_qty REAL NOT NULL DEFAULT 0,
+            rejected_qty REAL NOT NULL DEFAULT 0,
+            good_qty REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Not Started',
+            operator_name TEXT DEFAULT '',
+            supervisor_name TEXT DEFAULT '',
+            remarks TEXT DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
         """
         self.conn.executescript(sql)
         self.conn.commit()
@@ -691,6 +712,89 @@ class Database:
                     )
         return errors
 
+    def save_production_updates(self, records, report_date):
+        """Save operator-entered quantities without deleting earlier progress."""
+        report_date = parse_date(report_date).isoformat()
+        saved = 0
+        with self.conn:
+            for record in records:
+                plan_id = str(record.get("plan_id") or "").strip()
+                if not plan_id or plan_id == "EXCEPTION":
+                    continue
+                actual = max(float(record.get("actual_qty") or 0), 0)
+                rejected = max(float(record.get("rejected_qty") or 0), 0)
+                rejected = min(rejected, actual)
+                good = max(actual - rejected, 0)
+                status = str(record.get("status") or "Not Started").strip()
+                if status not in ("Not Started", "Running", "Completed", "Hold", "Rework"):
+                    status = "Not Started"
+                self.conn.execute(
+                    """INSERT INTO production_updates
+                    (plan_id, schedule_id, customer_name, part_name,
+                     operation_name, process_sequence, machine_name, shift_name,
+                     report_date, planned_qty, actual_qty, rejected_qty, good_qty,
+                     status, operator_name, supervisor_name, remarks, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(plan_id) DO UPDATE SET
+                        report_date=excluded.report_date,
+                        actual_qty=excluded.actual_qty,
+                        rejected_qty=excluded.rejected_qty,
+                        good_qty=excluded.good_qty,
+                        status=excluded.status,
+                        operator_name=excluded.operator_name,
+                        supervisor_name=excluded.supervisor_name,
+                        remarks=excluded.remarks,
+                        updated_at=excluded.updated_at""",
+                    (
+                        plan_id,
+                        str(record.get("schedule_id") or ""),
+                        str(record.get("customer_name") or ""),
+                        str(record.get("part_name") or ""),
+                        str(record.get("operation_name") or ""),
+                        int(float(record.get("process_sequence") or 0)),
+                        str(record.get("machine_name") or ""),
+                        str(record.get("shift_name") or ""),
+                        report_date,
+                        float(record.get("planned_qty") or 0),
+                        actual,
+                        rejected,
+                        good,
+                        status,
+                        str(record.get("operator_name") or ""),
+                        str(record.get("supervisor_name") or ""),
+                        str(record.get("remarks") or ""),
+                        datetime.now().isoformat(sep=" ", timespec="seconds"),
+                    ),
+                )
+                saved += 1
+        return saved
+
+    def production_progress_rows(self):
+        return self.conn.execute(
+            """SELECT * FROM production_updates
+               ORDER BY report_date DESC, machine_name, process_sequence"""
+        ).fetchall()
+
+    def completed_good_qty(self, schedule_id, part_name):
+        """Accepted output at the last in-house process; used to reduce re-planning."""
+        final_row = self.conn.execute(
+            """SELECT MAX(process_sequence) AS final_sequence
+               FROM process_bom
+               WHERE part_name = ? AND process_type = 'INHOUSE'""",
+            (part_name,),
+        ).fetchone()
+        final_sequence = final_row["final_sequence"] if final_row else None
+        if final_sequence is None:
+            return 0.0
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(good_qty), 0) AS completed_qty
+               FROM production_updates
+               WHERE schedule_id = ? AND part_name = ?
+                 AND process_sequence = ? AND actual_qty > 0""",
+            (schedule_id, part_name, final_sequence),
+        ).fetchone()
+        return float(row["completed_qty"] or 0)
+
     def generate_plan(self):
         errors = self.validate()
         if errors:
@@ -802,7 +906,12 @@ class Database:
                     transportation_batch = production_batch
 
                 total_qty = math.ceil(demand / production_batch) * production_batch
-                remaining = total_qty
+                completed_qty = self.completed_good_qty(
+                    schedule["schedule_id"], part_name
+                )
+                remaining = max(total_qty - completed_qty, 0)
+                if remaining <= 0:
+                    continue
                 lot_number = 1
                 due_dt = datetime.fromisoformat(schedule["due_datetime"])
 
@@ -981,10 +1090,19 @@ class Database:
         selected_date = parse_date(selected_date)
         rows = []
         for row in self.conn.execute(
-            """SELECT p.*, COALESCE(s.priority, 999) AS priority
+            """SELECT p.*, COALESCE(s.priority, 999) AS priority,
+                      COALESCE(u.actual_qty, 0) AS actual_qty,
+                      COALESCE(u.rejected_qty, 0) AS rejected_qty,
+                      COALESCE(u.good_qty, 0) AS good_qty,
+                      COALESCE(u.status, 'Not Started') AS status,
+                      COALESCE(u.operator_name, '') AS operator_name,
+                      COALESCE(u.supervisor_name, '') AS supervisor_name,
+                      COALESCE(u.remarks, '') AS remarks
                FROM production_plan p
                LEFT JOIN customer_schedules s
                  ON p.schedule_id = s.schedule_id
+               LEFT JOIN production_updates u
+                 ON p.plan_id = u.plan_id
                WHERE p.process_type = 'INHOUSE'
                  AND p.start_datetime IS NOT NULL
                  AND TRIM(p.start_datetime) <> ''
@@ -1434,6 +1552,8 @@ def create_machine_slips_pdf(rows, selected_date, output_path):
         max_rows = 12
         shown_operations = operations[:max_rows]
         total_planned = 0.0
+        total_actual = 0.0
+        total_rejected = 0.0
 
         for index, row in enumerate(shown_operations, start=1):
             y = header_row_y - index * row_h
@@ -1452,13 +1572,15 @@ def create_machine_slips_pdf(rows, selected_date, output_path):
                 row["part_name"],
                 row["operation_name"],
                 f"{float(row['planned_qty'] or 0):g}",
-                "",
-                "",
+                f"{float(row['actual_qty'] or 0):g}" if float(row['actual_qty'] or 0) else "",
+                f"{float(row['rejected_qty'] or 0):g}" if float(row['rejected_qty'] or 0) else "",
                 str(row["priority"] if "priority" in row.keys() else ""),
-                "",
-                "",
+                str(row["status"] or ""),
+                str(row["remarks"] or ""),
             ]
             total_planned += float(row["planned_qty"] or 0)
+            total_actual += float(row["actual_qty"] or 0)
+            total_rejected += float(row["rejected_qty"] or 0)
 
             current_x = table_x
             for col_index, (value, width) in enumerate(zip(values, widths)):
@@ -1486,10 +1608,10 @@ def create_machine_slips_pdf(rows, selected_date, output_path):
               "Total Planned Qty", f"{total_planned:g}",
               colors.HexColor("#D9EAF7"))
         field(77 * mm, totals_y, 66 * mm, 9 * mm,
-              "Total Actual Qty", "",
+              "Total Actual Qty", f"{total_actual:g}" if total_actual else "",
               colors.HexColor("#E2F0D9"))
         field(146 * mm, totals_y, 66 * mm, 9 * mm,
-              "Total Rejected Qty", "",
+              "Total Rejected Qty", f"{total_rejected:g}" if total_rejected else "",
               colors.HexColor("#F4CCCC"))
         field(215 * mm, totals_y, 74 * mm, 9 * mm,
               "Machine Utilization", "____ %",

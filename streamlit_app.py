@@ -212,12 +212,15 @@ operation_count = db.conn.execute("SELECT COUNT(*) FROM process_bom").fetchone()
 machine_count = db.conn.execute("SELECT COUNT(DISTINCT machine_name) FROM machine_recommendations").fetchone()[0]
 plan_count = db.conn.execute("SELECT COUNT(*) FROM production_plan WHERE plan_id <> 'EXCEPTION'").fetchone()[0]
 exception_count = db.conn.execute("SELECT COUNT(*) FROM production_plan WHERE plan_id = 'EXCEPTION'").fetchone()[0]
+produced_good_qty = db.conn.execute(
+    "SELECT COALESCE(SUM(good_qty), 0) FROM production_updates"
+).fetchone()[0]
 
-metrics = st.columns(6)
+metrics = st.columns(7)
 for column, label, value in zip(
     metrics,
-    ["Schedules", "Parts", "Operations", "Machines", "Plan Rows", "Exceptions"],
-    [schedule_count, part_count, operation_count, machine_count, plan_count, exception_count],
+    ["Schedules", "Parts", "Operations", "Machines", "Plan Rows", "Exceptions", "Good Qty Reported"],
+    [schedule_count, part_count, operation_count, machine_count, plan_count, exception_count, produced_good_qty],
 ):
     column.metric(label, value)
 
@@ -235,8 +238,8 @@ if validation_issues:
             st.info(f"Additional issues not displayed: {len(validation_issues) - 200}")
 
 # Tabs
-dashboard_tab, plan_tab, slips_tab, data_tab = st.tabs(
-    ["Dashboard", "Production Plan", "Machine Slips", "Imported Data"]
+dashboard_tab, plan_tab, slips_tab, progress_tab, data_tab = st.tabs(
+    ["Dashboard", "Production Plan", "Machine Slips", "Production Progress", "Imported Data"]
 )
 
 with dashboard_tab:
@@ -282,7 +285,12 @@ with plan_tab:
         )
 
 with slips_tab:
-    st.subheader("Approved Machine Daily Production Slips")
+    st.subheader("Operator Machine Slip Updates")
+    st.info(
+        "Enter Actual Qty and Rejected Qty. The accepted Good Qty is Actual minus Rejected. "
+        "When the next production plan is generated, accepted quantity at the final in-house "
+        "operation is deducted automatically from the remaining requirement."
+    )
     selected_date = st.date_input(
         "Slip date",
         value=st.session_state.selected_slip_date,
@@ -294,27 +302,82 @@ with slips_tab:
     if slip_df.empty:
         st.info(f"No in-house operations found for {selected_date:%d-%b-%Y}.")
     else:
-        display_cols = [
-            "machine_name", "shift_name", "customer_name", "operation_name",
-            "part_name", "planned_qty", "start_datetime", "end_datetime",
-            "schedule_id", "priority",
+        edit_cols = [
+            "plan_id", "machine_name", "shift_name", "customer_name",
+            "operation_name", "part_name", "planned_qty", "actual_qty",
+            "rejected_qty", "status", "operator_name", "supervisor_name",
+            "remarks", "start_datetime", "end_datetime", "schedule_id",
+            "process_sequence", "priority",
         ]
-        st.dataframe(
-            slip_df[[c for c in display_cols if c in slip_df.columns]],
+        editor_df = slip_df[[c for c in edit_cols if c in slip_df.columns]].copy()
+        edited_df = st.data_editor(
+            editor_df,
             hide_index=True,
             use_container_width=True,
+            height=480,
+            disabled=[
+                "plan_id", "machine_name", "shift_name", "customer_name",
+                "operation_name", "part_name", "planned_qty",
+                "start_datetime", "end_datetime", "schedule_id",
+                "process_sequence", "priority",
+            ],
+            column_config={
+                "actual_qty": st.column_config.NumberColumn("Actual Qty", min_value=0.0, step=1.0),
+                "rejected_qty": st.column_config.NumberColumn("Rejected Qty", min_value=0.0, step=1.0),
+                "status": st.column_config.SelectboxColumn(
+                    "Status",
+                    options=["Not Started", "Running", "Completed", "Hold", "Rework"],
+                ),
+                "operator_name": st.column_config.TextColumn("Operator"),
+                "supervisor_name": st.column_config.TextColumn("Supervisor"),
+                "remarks": st.column_config.TextColumn("Remarks"),
+            },
+            key=f"slip_editor_{selected_date.isoformat()}",
         )
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if st.button("Save Operator Production Update", type="primary", use_container_width=True):
+                records = edited_df.fillna("").to_dict("records")
+                saved = db.save_production_updates(records, selected_date)
+                st.success(f"{saved} operation update(s) saved. Subsequent planning will use this progress.")
+                st.rerun()
+        with c2:
+            st.caption(
+                "Only accepted output from the last in-house process is deducted from the schedule, "
+                "preventing the same quantity from being counted at every intermediate operation."
+            )
+
         pdf_data = slip_pdf_bytes(selected_date)
         st.download_button(
             "Download Approved Slip PDF",
             data=pdf_data,
             file_name=f"Machine_Slips_{selected_date.isoformat()}.pdf",
             mime="application/pdf",
-            type="primary",
         )
-        st.caption(
-            "The PDF groups operations by selected Date + Machine + Shift, one page per group. "
-            "Use the browser PDF viewer to print."
+
+with progress_tab:
+    st.subheader("Production Progress Register")
+    progress_df = rows_to_dataframe(db.production_progress_rows())
+    if progress_df.empty:
+        st.info("No operator production updates have been saved.")
+    else:
+        show_cols = [
+            "report_date", "schedule_id", "customer_name", "part_name",
+            "operation_name", "machine_name", "planned_qty", "actual_qty",
+            "rejected_qty", "good_qty", "status", "operator_name",
+            "supervisor_name", "remarks", "updated_at",
+        ]
+        st.dataframe(
+            progress_df[[c for c in show_cols if c in progress_df.columns]],
+            hide_index=True,
+            use_container_width=True,
+            height=540,
+        )
+        st.download_button(
+            "Download Production Progress CSV",
+            data=progress_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"Production_Progress_{date.today().isoformat()}.csv",
+            mime="text/csv",
         )
 
 with data_tab:
