@@ -76,6 +76,89 @@ def rows_to_dataframe(rows) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def filter_and_sort_table(df: pd.DataFrame, key_prefix: str,
+                          filter_columns=None, default_sort=None) -> pd.DataFrame:
+    """Provide global search, column filters and sorting for displayed tables."""
+    if df.empty:
+        return df
+
+    working = df.copy()
+    filter_columns = [
+        column for column in (filter_columns or [])
+        if column in working.columns
+    ]
+
+    with st.expander("Filter and Sort", expanded=False):
+        search_text = st.text_input(
+            "Search all displayed columns",
+            key=f"{key_prefix}_global_search",
+            placeholder="Customer, part, machine, operator, schedule ID...",
+        ).strip()
+
+        if search_text:
+            mask = pd.Series(False, index=working.index)
+            for column in working.columns:
+                mask = mask | working[column].astype(str).str.contains(
+                    search_text, case=False, na=False
+                )
+            working = working[mask]
+
+        if filter_columns:
+            filter_grid = st.columns(min(3, len(filter_columns)))
+            for index, column in enumerate(filter_columns):
+                values = sorted(
+                    value for value in working[column].dropna().astype(str).unique()
+                    if value.strip()
+                )
+                selected = filter_grid[index % len(filter_grid)].multiselect(
+                    column.replace("_", " ").title(),
+                    values,
+                    key=f"{key_prefix}_filter_{column}",
+                )
+                if selected:
+                    working = working[
+                        working[column].astype(str).isin(selected)
+                    ]
+
+        sort_columns = list(working.columns)
+        default_index = 0
+        if default_sort in sort_columns:
+            default_index = sort_columns.index(default_sort)
+
+        c1, c2 = st.columns([2, 1])
+        sort_column = c1.selectbox(
+            "Sort by",
+            sort_columns,
+            index=default_index,
+            key=f"{key_prefix}_sort_column",
+        )
+        sort_order = c2.radio(
+            "Order",
+            ["Ascending", "Descending"],
+            horizontal=True,
+            key=f"{key_prefix}_sort_order",
+        )
+
+        try:
+            working = working.sort_values(
+                sort_column,
+                ascending=(sort_order == "Ascending"),
+                na_position="last",
+            )
+        except Exception:
+            working = working.assign(
+                _sort_value=working[sort_column].astype(str)
+            ).sort_values(
+                "_sort_value",
+                ascending=(sort_order == "Ascending"),
+                na_position="last",
+            ).drop(columns=["_sort_value"])
+
+        st.caption(f"Showing {len(working):,} of {len(df):,} rows.")
+
+    return working
+
+
 def show_import_report(report: dict) -> None:
     counts = report.get("counts", {})
     count_df = pd.DataFrame(
@@ -285,7 +368,17 @@ with dashboard_tab:
             """,
             db.conn,
         )
-        st.dataframe(summary_df, hide_index=True, use_container_width=True)
+        summary_view = filter_and_sort_table(
+            summary_df,
+            "machine_loading",
+            filter_columns=["Machine", "Shift"],
+            default_sort="Machine",
+        )
+        st.dataframe(
+            summary_view,
+            hide_index=True,
+            use_container_width=True,
+        )
     else:
         st.info("Import data and generate a plan to see machine loading.")
 
@@ -301,12 +394,33 @@ with plan_tab:
             "end_datetime", "process_sequence", "process_type", "due_datetime", "note",
         ]
         columns = [col for col in preferred if col in plan_df.columns]
-        st.dataframe(plan_df[columns], hide_index=True, use_container_width=True, height=520)
+        plan_view = filter_and_sort_table(
+            plan_df[columns],
+            "production_plan",
+            filter_columns=[
+                "customer_name", "part_name", "machine_name",
+                "operation_name", "shift_name", "process_type",
+                "schedule_id",
+            ],
+            default_sort="start_datetime",
+        )
+        st.dataframe(
+            plan_view,
+            hide_index=True,
+            use_container_width=True,
+            height=520,
+        )
         st.download_button(
-            "Download Production Plan Excel",
+            "Download Full Production Plan Excel",
             data=export_plan_bytes(),
             file_name=f"Electro_Dip_Production_Plan_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "Download Filtered Production Plan CSV",
+            data=plan_view.to_csv(index=False).encode("utf-8"),
+            file_name=f"Filtered_Production_Plan_{date.today().isoformat()}.csv",
+            mime="text/csv",
         )
 
 with slips_tab:
@@ -336,6 +450,17 @@ with slips_tab:
             "process_sequence", "priority",
         ]
         editor_df = slip_df[[c for c in edit_cols if c in slip_df.columns]].copy()
+        editor_df = filter_and_sort_table(
+            editor_df,
+            f"machine_slips_{selected_date.isoformat()}",
+            filter_columns=[
+                "machine_name", "shift_name", "customer_name",
+                "part_name", "operation_name", "status", "operator_name",
+            ],
+            default_sort="start_datetime",
+        )
+
+        operator_options = [""] + db.active_operator_names()
         edited_df = st.data_editor(
             editor_df,
             hide_index=True,
@@ -354,7 +479,11 @@ with slips_tab:
                     "Status",
                     options=["Not Started", "Running", "Completed", "Hold", "Rework"],
                 ),
-                "operator_name": st.column_config.TextColumn("Operator"),
+                "operator_name": st.column_config.SelectboxColumn(
+                    "Operator",
+                    options=operator_options,
+                    required=False,
+                ),
                 "supervisor_name": st.column_config.TextColumn("Supervisor"),
                 "remarks": st.column_config.TextColumn("Remarks"),
             },
@@ -393,15 +522,25 @@ with progress_tab:
             "rejected_qty", "good_qty", "status", "operator_name",
             "supervisor_name", "remarks", "updated_at",
         ]
-        st.dataframe(
+        progress_view = filter_and_sort_table(
             progress_df[[c for c in show_cols if c in progress_df.columns]],
+            "production_progress",
+            filter_columns=[
+                "report_date", "customer_name", "part_name",
+                "machine_name", "operation_name", "shift_name",
+                "operator_name", "status",
+            ],
+            default_sort="report_date",
+        )
+        st.dataframe(
+            progress_view,
             hide_index=True,
             use_container_width=True,
             height=540,
         )
         st.download_button(
-            "Download Production Progress CSV",
-            data=progress_df.to_csv(index=False).encode("utf-8"),
+            "Download Filtered Production Progress CSV",
+            data=progress_view.to_csv(index=False).encode("utf-8"),
             file_name=f"Production_Progress_{date.today().isoformat()}.csv",
             mime="text/csv",
         )
@@ -413,11 +552,31 @@ with data_tab:
         [
             "customer_schedules", "stock_demand", "batch_config", "process_bom",
             "machine_recommendations", "machine_downtime", "shifts", "breaks",
-            "holidays", "weekly_offs",
+            "holidays", "weekly_offs", "operators",
         ],
     )
-    master_df = pd.read_sql_query(f"SELECT * FROM {data_choice} LIMIT 10000", db.conn)
-    st.dataframe(master_df, hide_index=True, use_container_width=True, height=520)
+    master_df = pd.read_sql_query(
+        f"SELECT * FROM {data_choice} LIMIT 10000",
+        db.conn,
+    )
+    master_view = filter_and_sort_table(
+        master_df,
+        f"master_{data_choice}",
+        filter_columns=list(master_df.columns[:6]),
+        default_sort=master_df.columns[0] if len(master_df.columns) else None,
+    )
+    st.dataframe(
+        master_view,
+        hide_index=True,
+        use_container_width=True,
+        height=520,
+    )
+    st.download_button(
+        "Download Filtered Table CSV",
+        data=master_view.to_csv(index=False).encode("utf-8"),
+        file_name=f"{data_choice}_filtered.csv",
+        mime="text/csv",
+    )
 
 st.divider()
 st.caption(

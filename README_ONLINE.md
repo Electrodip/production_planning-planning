@@ -76,3 +76,16 @@ Rules:
 - Standard transportation batch is used for normal lots.
 - The final lot may be smaller than the transportation batch.
 - Dashboard shows original requirement, accepted produced quantity and revised plan quantity.
+
+
+## Version 7 — Operator Dropdown, Filtering and Sorting
+
+- New Operators worksheet in the Excel import template.
+- Active operators appear in a dropdown in Machine Slips.
+- Operator master fields: Operator ID, Name, Department, Skill/Machine Group, Shift and Active status.
+- Production Plan has global search, multi-select filters and ascending/descending sorting.
+- Machine Slips have filters for machine, shift, customer, part, operation, status and operator.
+- Production Progress has filtering and sorting.
+- Machine Loading summary has filtering and sorting.
+- Imported Master Data tables have filtering, sorting and filtered CSV download.
+- Filtered Production Plan and Production Progress can be downloaded as CSV.

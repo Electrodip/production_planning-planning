@@ -192,6 +192,15 @@ class Database:
             is_off INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS operators (
+            operator_id TEXT PRIMARY KEY,
+            operator_name TEXT NOT NULL,
+            department TEXT DEFAULT '',
+            skill_group TEXT DEFAULT '',
+            shift_name TEXT DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
         CREATE TABLE IF NOT EXISTS production_plan (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             plan_id TEXT,
@@ -238,7 +247,7 @@ class Database:
         tables = [
             "customer_schedules", "stock_demand", "batch_config", "process_bom",
             "machine_recommendations", "machine_downtime", "shifts", "breaks",
-            "holidays", "weekly_offs", "production_plan"
+            "holidays", "weekly_offs", "operators", "production_plan"
         ]
         with self.conn:
             for table in tables:
@@ -279,6 +288,7 @@ class Database:
                 "Breaks": 0,
                 "Holidays": 0,
                 "Weekly Off Rows": 0,
+                "Operators": 0,
             },
             "blank_rows_skipped": 0,
             "placeholder_rows_skipped": 0,
@@ -675,8 +685,60 @@ class Database:
                 )
                 report["counts"]["Weekly Off Rows"] += 1
 
+            # ---------------- Operators ----------------
+            if "Operators" in workbook.sheetnames:
+                ws = workbook["Operators"]
+                for row_number, row in iter_data_rows(ws):
+                    if is_blank(row[0]) or is_blank(row[1]):
+                        warn(
+                            ws.title, row_number,
+                            "Skipped: Operator ID and Operator Name are required."
+                        )
+                        continue
+
+                    active_value = str(row[5] or "Y").strip().upper()
+                    self.conn.execute(
+                        """INSERT OR REPLACE INTO operators
+                        (operator_id, operator_name, department,
+                         skill_group, shift_name, active)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(row[0]).strip(),
+                            str(row[1]).strip(),
+                            str(row[2] or "").strip(),
+                            str(row[3] or "").strip(),
+                            str(row[4] or "").strip(),
+                            1 if active_value in ("Y", "YES", "1", "TRUE") else 0,
+                        )
+                    )
+                    report["counts"]["Operators"] += 1
+            else:
+                warn(
+                    "Operators", 0,
+                    "Operators worksheet is missing. Operator dropdown will be empty."
+                )
+
         workbook.close()
         return report
+
+
+    def active_operator_names(self, shift_name=None):
+        """Return active operator names, optionally filtered by shift."""
+        if shift_name:
+            rows = self.conn.execute(
+                """SELECT operator_name FROM operators
+                   WHERE active = 1
+                     AND (TRIM(shift_name) = '' OR shift_name = ?)
+                   ORDER BY operator_name""",
+                (shift_name,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT operator_name FROM operators
+                   WHERE active = 1
+                   ORDER BY operator_name"""
+            ).fetchall()
+        return [str(row["operator_name"]) for row in rows]
 
 
     def validate(self):
