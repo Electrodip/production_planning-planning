@@ -795,6 +795,51 @@ class Database:
         ).fetchone()
         return float(row["completed_qty"] or 0)
 
+    def revised_quantity_rows(self):
+        """Return schedule-wise original, produced and revised quantities."""
+        rows = []
+        schedules = self.conn.execute(
+            """SELECT * FROM customer_schedules
+               ORDER BY due_datetime, priority"""
+        ).fetchall()
+
+        for schedule in schedules:
+            part_name = schedule["part_name"]
+            stock = self.conn.execute(
+                "SELECT * FROM stock_demand WHERE part_name = ?",
+                (part_name,),
+            ).fetchone()
+
+            current_stock = float(stock["current_stock"] or 0) if stock else 0.0
+            minimum_stock = float(stock["minimum_stock"] or 0) if stock else 0.0
+            original_net = max(
+                float(schedule["customer_qty"] or 0)
+                + minimum_stock
+                - current_stock,
+                0.0,
+            )
+            accepted = self.completed_good_qty(
+                schedule["schedule_id"], part_name
+            )
+            revised = max(original_net - accepted, 0.0)
+
+            rows.append({
+                "schedule_id": schedule["schedule_id"],
+                "customer_name": schedule["customer_name"],
+                "part_name": part_name,
+                "customer_required_qty": float(schedule["customer_qty"] or 0),
+                "minimum_stock": minimum_stock,
+                "current_stock": current_stock,
+                "original_net_requirement": original_net,
+                "accepted_produced_qty": accepted,
+                "revised_plan_qty": revised,
+                "due_datetime": schedule["due_datetime"],
+                "priority": schedule["priority"],
+            })
+
+        return rows
+
+
     def generate_plan(self):
         errors = self.validate()
         if errors:
@@ -894,22 +939,29 @@ class Database:
                 production_batch = batch["production_batch"] if batch else 0
                 transportation_batch = batch["transportation_batch"] if batch else 0
 
-                demand = max(
+                original_net_requirement = max(
                     0,
                     schedule["customer_qty"] + minimum_stock - current_stock
                 )
-                if demand <= 0:
+                if original_net_requirement <= 0:
                     continue
+
                 if production_batch <= 0:
-                    production_batch = demand
+                    production_batch = original_net_requirement
                 if transportation_batch <= 0:
                     transportation_batch = production_batch
 
-                total_qty = math.ceil(demand / production_batch) * production_batch
                 completed_qty = self.completed_good_qty(
                     schedule["schedule_id"], part_name
                 )
-                remaining = max(total_qty - completed_qty, 0)
+
+                # Revised quantity is always the exact remaining balance.
+                # Do not round the remaining requirement back up to a full
+                # production batch after operator progress has been reported.
+                remaining = max(
+                    original_net_requirement - completed_qty,
+                    0
+                )
                 if remaining <= 0:
                     continue
                 lot_number = 1

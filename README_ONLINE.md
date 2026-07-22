@@ -60,3 +60,19 @@ executes a rerun on another thread.
 - The next planning run deducts cumulative good quantity reported at the last in-house process.
 - Intermediate-operation output is retained as progress but is not double-counted against customer demand.
 - A Production Progress tab provides the complete update history and CSV download.
+
+
+## Version 6 — Revised Production Quantity
+
+Every new planning run now calculates:
+
+Revised Plan Qty =
+Customer Required Qty + Minimum Stock - Current Stock - Accepted Produced Qty
+
+Rules:
+- Accepted Produced Qty = Actual Qty - Rejected Qty.
+- Only accepted output reported at the final in-house process reduces demand.
+- Remaining quantity is not rounded back to a full production batch.
+- Standard transportation batch is used for normal lots.
+- The final lot may be smaller than the transportation batch.
+- Dashboard shows original requirement, accepted produced quantity and revised plan quantity.

@@ -244,6 +244,31 @@ dashboard_tab, plan_tab, slips_tab, progress_tab, data_tab = st.tabs(
 
 with dashboard_tab:
     st.subheader("Planning Overview")
+
+    revised_df = rows_to_dataframe(db.revised_quantity_rows())
+    if not revised_df.empty:
+        st.markdown("#### Revised Production Quantities")
+        display_columns = [
+            "schedule_id", "customer_name", "part_name",
+            "customer_required_qty", "minimum_stock", "current_stock",
+            "original_net_requirement", "accepted_produced_qty",
+            "revised_plan_qty", "due_datetime", "priority",
+        ]
+        revised_columns = [
+            column for column in display_columns
+            if column in revised_df.columns
+        ]
+        st.dataframe(
+            revised_df[revised_columns],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(
+            "Revised Plan Qty = Customer Required Qty + Minimum Stock "
+            "− Current Stock − Accepted Produced Qty. "
+            "The final transportation lot may be smaller than the standard batch."
+        )
+
     if plan_count:
         summary_df = pd.read_sql_query(
             """
@@ -289,7 +314,8 @@ with slips_tab:
     st.info(
         "Enter Actual Qty and Rejected Qty. The accepted Good Qty is Actual minus Rejected. "
         "When the next production plan is generated, accepted quantity at the final in-house "
-        "operation is deducted automatically from the remaining requirement."
+        "operation is deducted automatically. The revised plan uses the exact remaining "
+        "balance, and the final transportation lot may be smaller."
     )
     selected_date = st.date_input(
         "Slip date",
