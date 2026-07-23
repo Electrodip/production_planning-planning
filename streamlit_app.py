@@ -1,585 +1,287 @@
-import io
+
 import os
-import tempfile
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from planner_core import Database, create_machine_slips_pdf, parse_date
+from planner_core import Database
 
-APP_TITLE = "Electro-Dip Online Production Planner"
+
+APP_TITLE = "Electro-Dip Production Planner with WIP"
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = BASE_DIR / "Electro_Dip_Import_Template.xlsx"
-LOGO_PATH = BASE_DIR / "electro_dip_logo.png"
+DB_PATH = BASE_DIR / "electro_dip_persistent.db"
+TEMPLATE_PATH = BASE_DIR / "Electro_Dip_WIP_Import_Template_V7.xlsx"
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🏭",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title=APP_TITLE, page_icon="🏭", layout="wide")
 
 
-def check_password() -> bool:
-    """Optional password protection using Streamlit secrets."""
-    try:
-        expected = st.secrets.get("APP_PASSWORD", "")
-    except Exception:
-        expected = ""
-    if not expected:
-        return True
-
-    if st.session_state.get("authenticated"):
-        return True
-
-    st.title("🔒 Electro-Dip Production Planner")
-    password = st.text_input("Enter app password", type="password")
-    if st.button("Sign in", type="primary"):
-        if password == expected:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-    return False
+def get_db():
+    return Database(DB_PATH)
 
 
-if not check_password():
-    st.stop()
+db = get_db()
 
-
-def get_database(session_id: str) -> Database:
-    """Open a fresh SQLite connection for each Streamlit rerun.
-
-    Streamlit may execute reruns on different threads. A cached SQLite
-    connection can therefore raise sqlite3.ProgrammingError. The database
-    file remains session-specific, while the connection is created in the
-    current execution thread.
-    """
-    db_path = Path(tempfile.gettempdir()) / f"electro_dip_{session_id}.db"
-    return Database(db_path)
-
-
-if "session_id" not in st.session_state:
-    st.session_state.session_id = os.urandom(12).hex()
-if "import_report" not in st.session_state:
-    st.session_state.import_report = None
-if "selected_slip_date" not in st.session_state:
-    st.session_state.selected_slip_date = date.today()
-
-db = get_database(st.session_state.session_id)
-
-
-def rows_to_dataframe(rows) -> pd.DataFrame:
-    records = [dict(row) for row in rows]
-    return pd.DataFrame(records)
-
-
-def filter_and_sort_table(df: pd.DataFrame, key_prefix: str,
-                          filter_columns=None, default_sort=None) -> pd.DataFrame:
-    """Provide global search, column filters and sorting for displayed tables."""
-    if df.empty:
-        return df
-
-    working = df.copy()
-    filter_columns = [
-        column for column in (filter_columns or [])
-        if column in working.columns
-    ]
-
-    with st.expander("Filter and Sort", expanded=False):
-        search_text = st.text_input(
-            "Search all displayed columns",
-            key=f"{key_prefix}_global_search",
-            placeholder="Customer, part, machine, operator, schedule ID...",
-        ).strip()
-
-        if search_text:
-            mask = pd.Series(False, index=working.index)
-            for column in working.columns:
-                mask = mask | working[column].astype(str).str.contains(
-                    search_text, case=False, na=False
-                )
-            working = working[mask]
-
-        if filter_columns:
-            filter_grid = st.columns(min(3, len(filter_columns)))
-            for index, column in enumerate(filter_columns):
-                values = sorted(
-                    value for value in working[column].dropna().astype(str).unique()
-                    if value.strip()
-                )
-                selected = filter_grid[index % len(filter_grid)].multiselect(
-                    column.replace("_", " ").title(),
-                    values,
-                    key=f"{key_prefix}_filter_{column}",
-                )
-                if selected:
-                    working = working[
-                        working[column].astype(str).isin(selected)
-                    ]
-
-        sort_columns = list(working.columns)
-        default_index = 0
-        if default_sort in sort_columns:
-            default_index = sort_columns.index(default_sort)
-
-        c1, c2 = st.columns([2, 1])
-        sort_column = c1.selectbox(
-            "Sort by",
-            sort_columns,
-            index=default_index,
-            key=f"{key_prefix}_sort_column",
-        )
-        sort_order = c2.radio(
-            "Order",
-            ["Ascending", "Descending"],
-            horizontal=True,
-            key=f"{key_prefix}_sort_order",
-        )
-
-        try:
-            working = working.sort_values(
-                sort_column,
-                ascending=(sort_order == "Ascending"),
-                na_position="last",
-            )
-        except Exception:
-            working = working.assign(
-                _sort_value=working[sort_column].astype(str)
-            ).sort_values(
-                "_sort_value",
-                ascending=(sort_order == "Ascending"),
-                na_position="last",
-            ).drop(columns=["_sort_value"])
-
-        st.caption(f"Showing {len(working):,} of {len(df):,} rows.")
-
-    return working
-
-
-def show_import_report(report: dict) -> None:
-    counts = report.get("counts", {})
-    count_df = pd.DataFrame(
-        [{"Data Group": name, "Imported Records": value} for name, value in counts.items()]
-    )
-    st.success("Excel data imported successfully.")
-    st.dataframe(count_df, hide_index=True, use_container_width=True)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Blank rows skipped", report.get("blank_rows_skipped", 0))
-    c2.metric("Placeholder rows", report.get("placeholder_rows_skipped", 0))
-    c3.metric("Operations without machines", report.get("operations_without_machines", 0))
-    c4.metric("Warnings", report.get("warning_count", 0))
-
-    warnings = report.get("warnings", [])
-    if warnings:
-        with st.expander("Import warnings (preview)", expanded=False):
-            for warning in warnings[:100]:
-                st.write("•", warning)
-            if report.get("warning_count", len(warnings)) > len(warnings):
-                st.info(
-                    f"Only the first {len(warnings)} warnings are displayed. "
-                    f"Total warnings: {report.get('warning_count')}"
-                )
-
-
-def export_plan_bytes() -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        path = tmp.name
-    try:
-        db.export_plan(path)
-        return Path(path).read_bytes()
-    finally:
-        Path(path).unlink(missing_ok=True)
-
-
-def slip_pdf_bytes(selected_date: date) -> bytes:
-    rows = db.todays_slips(selected_date)
-    if not rows:
-        return b""
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        path = Path(tmp.name)
-    try:
-        create_machine_slips_pdf(rows, selected_date, path)
-        return path.read_bytes()
-    finally:
-        path.unlink(missing_ok=True)
-
-
-# Header
-h1, h2 = st.columns([1, 8])
-with h1:
-    if LOGO_PATH.exists():
-        st.image(str(LOGO_PATH), width=90)
-with h2:
-    st.title("ELECTRO-DIP")
-    st.subheader("Online Production Planning System")
-
+st.title("ELECTRO-DIP")
+st.subheader("Online Production Planning System with Persistent WIP")
 st.caption(
-    "Excel import • 15 recommended machines • backward planning • machine-wise approved slips"
+    "Operator entries and WIP remain saved through imports and plan regeneration. "
+    "They are deleted only from the Clear Data tab."
 )
 
-# Sidebar
 with st.sidebar:
-    st.header("Data Import")
-    uploaded = st.file_uploader(
-        "Upload planning template",
-        type=["xlsx", "xlsm"],
-        help="Use the supplied Electro-Dip import template.",
-    )
-
+    st.header("Import Master Data")
+    uploaded = st.file_uploader("Upload Excel template", type=["xlsx", "xlsm"])
     if TEMPLATE_PATH.exists():
         st.download_button(
-            "Download Import Template",
-            data=TEMPLATE_PATH.read_bytes(),
-            file_name="Electro_Dip_Import_Template.xlsx",
+            "Download WIP Import Template",
+            TEMPLATE_PATH.read_bytes(),
+            file_name=TEMPLATE_PATH.name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-
     if st.button("Import Excel", type="primary", use_container_width=True):
         if uploaded is None:
             st.error("Select an Excel file first.")
         else:
-            suffix = Path(uploaded.name).suffix or ".xlsx"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(uploaded.getbuffer())
-                upload_path = Path(tmp.name)
-            try:
-                with st.spinner("Importing and checking data..."):
-                    report = db.import_workbook(upload_path)
-                st.session_state.import_report = report
-                st.success("Import completed.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Import failed: {exc}")
-            finally:
-                upload_path.unlink(missing_ok=True)
-
-    st.divider()
-    st.header("Planning Actions")
-    if st.button("Validate Inputs", use_container_width=True):
-        issues = db.validate()
-        if issues:
-            st.session_state.validation_issues = issues
-        else:
-            st.session_state.validation_issues = []
-            st.success("All inputs are valid.")
-
-    if st.button("Generate Production Plan", type="primary", use_container_width=True):
-        issues = db.validate()
-        if issues:
-            st.session_state.validation_issues = issues
-            st.error(f"Planning blocked: {len(issues)} validation issue(s).")
-        else:
-            try:
-                with st.spinner("Generating backward production plan..."):
-                    count = db.generate_plan()
-                st.session_state.plan_message = f"{count} operation rows created."
-                st.success(st.session_state.plan_message)
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Planning failed: {exc}")
-
-    if st.button("Clear Production Plan", use_container_width=True):
-        count = db.clear_plan()
-        st.success(f"{count} production-plan rows cleared successfully.")
-        st.rerun()
-
-# Metrics
-schedule_count = db.conn.execute("SELECT COUNT(*) FROM customer_schedules").fetchone()[0]
-part_count = db.conn.execute("SELECT COUNT(DISTINCT part_name) FROM process_bom").fetchone()[0]
-operation_count = db.conn.execute("SELECT COUNT(*) FROM process_bom").fetchone()[0]
-machine_count = db.conn.execute("SELECT COUNT(DISTINCT machine_name) FROM machine_recommendations").fetchone()[0]
-plan_count = db.conn.execute("SELECT COUNT(*) FROM production_plan WHERE plan_id <> 'EXCEPTION'").fetchone()[0]
-exception_count = db.conn.execute("SELECT COUNT(*) FROM production_plan WHERE plan_id = 'EXCEPTION'").fetchone()[0]
-produced_good_qty = db.conn.execute(
-    "SELECT COALESCE(SUM(good_qty), 0) FROM production_updates"
-).fetchone()[0]
-
-metrics = st.columns(7)
-for column, label, value in zip(
-    metrics,
-    ["Schedules", "Parts", "Operations", "Machines", "Plan Rows", "Exceptions", "Good Qty Reported"],
-    [schedule_count, part_count, operation_count, machine_count, plan_count, exception_count, produced_good_qty],
-):
-    column.metric(label, value)
-
-if st.session_state.import_report:
-    with st.expander("Latest import report", expanded=False):
-        show_import_report(st.session_state.import_report)
-
-validation_issues = st.session_state.get("validation_issues")
-if validation_issues:
-    st.error(f"Validation found {len(validation_issues)} issue(s).")
-    with st.expander("Validation issues", expanded=True):
-        for issue in validation_issues[:200]:
-            st.write("•", issue)
-        if len(validation_issues) > 200:
-            st.info(f"Additional issues not displayed: {len(validation_issues) - 200}")
-
-# Tabs
-dashboard_tab, plan_tab, slips_tab, progress_tab, data_tab = st.tabs(
-    ["Dashboard", "Production Plan", "Machine Slips", "Production Progress", "Imported Data"]
-)
-
-with dashboard_tab:
-    st.subheader("Planning Overview")
-
-    revised_df = rows_to_dataframe(db.revised_quantity_rows())
-    if not revised_df.empty:
-        st.markdown("#### Revised Production Quantities")
-        display_columns = [
-            "schedule_id", "customer_name", "part_name",
-            "customer_required_qty", "minimum_stock", "current_stock",
-            "original_net_requirement", "accepted_produced_qty",
-            "revised_plan_qty", "due_datetime", "priority",
-        ]
-        revised_columns = [
-            column for column in display_columns
-            if column in revised_df.columns
-        ]
-        st.dataframe(
-            revised_df[revised_columns],
-            hide_index=True,
-            use_container_width=True,
-        )
-        st.caption(
-            "Revised Plan Qty = Customer Required Qty + Minimum Stock "
-            "− Current Stock − Accepted Produced Qty. "
-            "The final transportation lot may be smaller than the standard batch."
-        )
-
-    if plan_count:
-        summary_df = pd.read_sql_query(
-            """
-            SELECT machine_name AS Machine,
-                   shift_name AS Shift,
-                   COUNT(*) AS Operations,
-                   ROUND(SUM(planned_qty), 2) AS Planned_Qty,
-                   MIN(start_datetime) AS First_Start,
-                   MAX(end_datetime) AS Last_End
-            FROM production_plan
-            WHERE plan_id <> 'EXCEPTION' AND process_type='INHOUSE'
-            GROUP BY machine_name, shift_name
-            ORDER BY Machine, Shift
-            """,
-            db.conn,
-        )
-        summary_view = filter_and_sort_table(
-            summary_df,
-            "machine_loading",
-            filter_columns=["Machine", "Shift"],
-            default_sort="Machine",
-        )
-        st.dataframe(
-            summary_view,
-            hide_index=True,
-            use_container_width=True,
-        )
-    else:
-        st.info("Import data and generate a plan to see machine loading.")
-
-with plan_tab:
-    st.subheader("Generated Production Plan")
-    plan_df = rows_to_dataframe(db.plan_rows())
-    if plan_df.empty:
-        st.info("No production plan has been generated.")
-    else:
-        preferred = [
-            "plan_id", "schedule_id", "customer_name", "shift_name", "machine_name",
-            "operation_name", "part_name", "planned_qty", "start_datetime",
-            "end_datetime", "process_sequence", "process_type", "due_datetime", "note",
-        ]
-        columns = [col for col in preferred if col in plan_df.columns]
-        plan_view = filter_and_sort_table(
-            plan_df[columns],
-            "production_plan",
-            filter_columns=[
-                "customer_name", "part_name", "machine_name",
-                "operation_name", "shift_name", "process_type",
-                "schedule_id",
-            ],
-            default_sort="start_datetime",
-        )
-        st.dataframe(
-            plan_view,
-            hide_index=True,
-            use_container_width=True,
-            height=520,
-        )
-        st.download_button(
-            "Download Full Production Plan Excel",
-            data=export_plan_bytes(),
-            file_name=f"Electro_Dip_Production_Plan_{date.today().isoformat()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "Download Filtered Production Plan CSV",
-            data=plan_view.to_csv(index=False).encode("utf-8"),
-            file_name=f"Filtered_Production_Plan_{date.today().isoformat()}.csv",
-            mime="text/csv",
-        )
-
-with slips_tab:
-    st.subheader("Operator Machine Slip Updates")
-    st.info(
-        "Enter Actual Qty and Rejected Qty. The accepted Good Qty is Actual minus Rejected. "
-        "When the next production plan is generated, accepted quantity at the final in-house "
-        "operation is deducted automatically. The revised plan uses the exact remaining "
-        "balance, and the final transportation lot may be smaller."
-    )
-    selected_date = st.date_input(
-        "Slip date",
-        value=st.session_state.selected_slip_date,
-        key="slip_date_widget",
-    )
-    st.session_state.selected_slip_date = selected_date
-    slip_rows = db.todays_slips(selected_date)
-    slip_df = rows_to_dataframe(slip_rows)
-    if slip_df.empty:
-        st.info(f"No in-house operations found for {selected_date:%d-%b-%Y}.")
-    else:
-        edit_cols = [
-            "plan_id", "machine_name", "shift_name", "customer_name",
-            "operation_name", "part_name", "planned_qty", "actual_qty",
-            "rejected_qty", "status", "operator_name", "supervisor_name",
-            "remarks", "start_datetime", "end_datetime", "schedule_id",
-            "process_sequence", "priority",
-        ]
-        editor_df = slip_df[[c for c in edit_cols if c in slip_df.columns]].copy()
-        editor_df = filter_and_sort_table(
-            editor_df,
-            f"machine_slips_{selected_date.isoformat()}",
-            filter_columns=[
-                "machine_name", "shift_name", "customer_name",
-                "part_name", "operation_name", "status", "operator_name",
-            ],
-            default_sort="start_datetime",
-        )
-
-        operator_options = [""] + db.active_operator_names()
-        edited_df = st.data_editor(
-            editor_df,
-            hide_index=True,
-            use_container_width=True,
-            height=480,
-            disabled=[
-                "plan_id", "machine_name", "shift_name", "customer_name",
-                "operation_name", "part_name", "planned_qty",
-                "start_datetime", "end_datetime", "schedule_id",
-                "process_sequence", "priority",
-            ],
-            column_config={
-                "actual_qty": st.column_config.NumberColumn("Actual Qty", min_value=0.0, step=1.0),
-                "rejected_qty": st.column_config.NumberColumn("Rejected Qty", min_value=0.0, step=1.0),
-                "status": st.column_config.SelectboxColumn(
-                    "Status",
-                    options=["Not Started", "Running", "Completed", "Hold", "Rework"],
-                ),
-                "operator_name": st.column_config.SelectboxColumn(
-                    "Operator",
-                    options=operator_options,
-                    required=False,
-                ),
-                "supervisor_name": st.column_config.TextColumn("Supervisor"),
-                "remarks": st.column_config.TextColumn("Remarks"),
-            },
-            key=f"slip_editor_{selected_date.isoformat()}",
-        )
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            if st.button("Save Operator Production Update", type="primary", use_container_width=True):
-                records = edited_df.fillna("").to_dict("records")
-                saved = db.save_production_updates(records, selected_date)
-                st.success(f"{saved} operation update(s) saved. Subsequent planning will use this progress.")
-                st.rerun()
-        with c2:
-            st.caption(
-                "Only accepted output from the last in-house process is deducted from the schedule, "
-                "preventing the same quantity from being counted at every intermediate operation."
+            report = db.import_workbook(uploaded)
+            st.session_state["import_report"] = report
+            st.success(
+                f"Imported successfully. Previous entries preserved: "
+                f"{report['previous_entries_preserved']}"
             )
 
-        pdf_data = slip_pdf_bytes(selected_date)
-        st.download_button(
-            "Download Approved Slip PDF",
-            data=pdf_data,
-            file_name=f"Machine_Slips_{selected_date.isoformat()}.pdf",
-            mime="application/pdf",
-        )
+    if st.button("Generate / Regenerate Plan", use_container_width=True):
+        count = db.generate_plan()
+        st.success(f"Production plan generated: {count} rows")
 
-with progress_tab:
-    st.subheader("Production Progress Register")
-    progress_df = rows_to_dataframe(db.production_progress_rows())
-    if progress_df.empty:
-        st.info("No operator production updates have been saved.")
+    if st.button("Clear Current Plan Only", use_container_width=True):
+        count = db.clear_plan()
+        st.info(f"{count} plan rows cleared. Operator entries and WIP were preserved.")
+
+if "import_report" in st.session_state:
+    with st.expander("Latest Import Report"):
+        report = st.session_state["import_report"]
+        st.json(report["counts"])
+        if report["warnings"]:
+            for warning in report["warnings"][:50]:
+                st.write("•", warning)
+
+tabs = st.tabs([
+    "Dashboard", "Production Plan", "Operator Entry",
+    "Process WIP Report", "WIP Ageing", "WIP Summaries",
+    "Schedule Calculation", "Process WIP Allocation",
+    "Previous Entries", "Download Excel", "Clear Data"
+])
+
+with tabs[0]:
+    entries = db.conn.execute("SELECT COUNT(*) FROM operator_entries").fetchone()[0]
+    wip_total = sum(r["wip_after_process"] for r in db.wip_rows())
+    dispatched = db.conn.execute(
+        """SELECT COALESCE(SUM(e.good_qty),0)
+           FROM operator_entries e
+           WHERE e.process_sequence = (
+               SELECT MAX(p.process_sequence)
+               FROM process_bom p WHERE p.part_name=e.part_name
+           )"""
+    ).fetchone()[0]
+    plan_rows = db.conn.execute("SELECT COUNT(*) FROM production_plan").fetchone()[0]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Saved Entries", entries)
+    c2.metric("Physical WIP Qty", round(wip_total, 2))
+    c3.metric("Dispatched Good Qty", round(float(dispatched or 0), 2))
+    c4.metric("Plan Rows", plan_rows)
+    st.info(
+        "Highest Process BOM sequence is treated as Dispatch. "
+        "Dispatch quantity is allocated FIFO to the earliest due schedule. "
+        "Minimum stock is generated once, after customer schedules."
+    )
+
+with tabs[1]:
+    st.subheader("WIP-Adjusted Production Plan")
+    plan_df = pd.DataFrame([dict(r) for r in db.plan_rows()])
+    if plan_df.empty:
+        st.info("Generate the plan to view results.")
     else:
-        show_cols = [
-            "report_date", "schedule_id", "customer_name", "part_name",
-            "operation_name", "machine_name", "planned_qty", "actual_qty",
-            "rejected_qty", "good_qty", "status", "operator_name",
-            "supervisor_name", "remarks", "updated_at",
-        ]
-        progress_view = filter_and_sort_table(
-            progress_df[[c for c in show_cols if c in progress_df.columns]],
-            "production_progress",
-            filter_columns=[
-                "report_date", "customer_name", "part_name",
-                "machine_name", "operation_name", "shift_name",
-                "operator_name", "status",
-            ],
-            default_sort="report_date",
+        st.dataframe(plan_df, hide_index=True, use_container_width=True, height=560)
+
+with tabs[2]:
+    st.subheader("Daily Operator Entry")
+    bom_df = pd.DataFrame([dict(r) for r in db.bom_rows()])
+    if bom_df.empty:
+        st.warning("Import Process BOM first.")
+    else:
+        parts = sorted(bom_df["part_name"].astype(str).unique())
+        part = st.selectbox("Part Number", parts)
+        part_ops = bom_df[bom_df["part_name"].astype(str) == str(part)]
+        sequence = st.selectbox(
+            "Process / Sequence",
+            part_ops["process_sequence"].tolist(),
+            format_func=lambda seq: (
+                f"{int(seq)} - "
+                f"{part_ops[part_ops['process_sequence']==seq]['operation_name'].iloc[0]}"
+            ),
         )
+        operation = part_ops[
+            part_ops["process_sequence"] == sequence
+        ]["operation_name"].iloc[0]
+
+        c1, c2, c3 = st.columns(3)
+        entry_date = c1.date_input("Entry Date", value=date.today())
+        machine = c2.text_input("Machine")
+        shift = c3.text_input("Shift")
+
+        c4, c5, c6 = st.columns(3)
+        actual = c4.number_input("Actual Qty", min_value=0.0, step=1.0)
+        rejected = c5.number_input("Rejected Qty", min_value=0.0, step=1.0)
+        planned = c6.number_input("Planned Qty", min_value=0.0, step=1.0)
+
+        c7, c8 = st.columns(2)
+        operator = c7.text_input("Operator Name")
+        supervisor = c8.text_input("Supervisor Name")
+        status = st.selectbox(
+            "Status", ["", "Running", "Completed", "Hold", "Rework"]
+        )
+        remarks = st.text_area("Remarks")
+
+        if st.button("Save Operator Entry", type="primary"):
+            if rejected > actual:
+                st.error("Rejected Qty cannot exceed Actual Qty.")
+            else:
+                good = db.add_operator_entry(
+                    entry_date=entry_date,
+                    part_name=part,
+                    process_sequence=int(sequence),
+                    operation_name=operation,
+                    actual_qty=actual,
+                    rejected_qty=rejected,
+                    machine_name=machine,
+                    shift_name=shift,
+                    planned_qty=planned,
+                    status=status,
+                    operator_name=operator,
+                    supervisor_name=supervisor,
+                    remarks=remarks,
+                )
+                st.success(
+                    f"Entry saved. Good Qty = {good:g}. "
+                    "This entry will remain until Clear Previous Entries is used."
+                )
+
+
+with tabs[3]:
+    st.subheader("Process-wise WIP Report")
+    report_df = pd.DataFrame(db.process_wip_report_rows())
+    if report_df.empty:
+        st.info("No WIP data.")
+    else:
+        f1, f2, f3, f4 = st.columns(4)
+        customers = ["All"] + sorted([x for x in report_df["customer_name"].dropna().astype(str).unique() if x])
+        parts = ["All"] + sorted(report_df["part_name"].astype(str).unique())
+        processes = ["All"] + sorted(report_df["operation_name"].astype(str).unique())
+        machines = ["All"] + sorted([x for x in report_df["machine_name"].dropna().astype(str).unique() if x])
+        customer = f1.selectbox("Customer", customers)
+        part = f2.selectbox("Part", parts)
+        process = f3.selectbox("Process", processes)
+        machine = f4.selectbox("Machine", machines)
+
+        filtered = report_df.copy()
+        if customer != "All":
+            filtered = filtered[filtered["customer_name"].astype(str) == customer]
+        if part != "All":
+            filtered = filtered[filtered["part_name"].astype(str) == part]
+        if process != "All":
+            filtered = filtered[filtered["operation_name"].astype(str) == process]
+        if machine != "All":
+            filtered = filtered[filtered["machine_name"].astype(str) == machine]
+
+        st.dataframe(filtered, hide_index=True, use_container_width=True, height=540)
+        st.caption("WIP Qty = normalized cumulative good at current process minus normalized cumulative good at next process.")
+
+with tabs[4]:
+    st.subheader("WIP Ageing")
+    ageing_df = pd.DataFrame(db.process_wip_report_rows())
+    ageing_df = ageing_df[ageing_df["wip_qty"] > 0] if not ageing_df.empty else ageing_df
+    if ageing_df.empty:
+        st.info("No open WIP.")
+    else:
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Total WIP", round(float(ageing_df["wip_qty"].sum()), 2))
+        a2.metric("Fresh", round(float(ageing_df.loc[ageing_df["age_status"]=="Fresh", "wip_qty"].sum()), 2))
+        a3.metric("Monitor", round(float(ageing_df.loc[ageing_df["age_status"]=="Monitor", "wip_qty"].sum()), 2))
+        a4.metric("Old WIP", round(float(ageing_df.loc[ageing_df["age_status"]=="Old WIP", "wip_qty"].sum()), 2))
         st.dataframe(
-            progress_view,
-            hide_index=True,
-            use_container_width=True,
-            height=540,
+            ageing_df.sort_values(["wip_age_days", "wip_qty"], ascending=[False, False]),
+            hide_index=True, use_container_width=True, height=520
         )
+
+with tabs[5]:
+    st.subheader("Machine / Part / Customer WIP")
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown("#### Machine-wise")
+        st.dataframe(pd.DataFrame(db.machine_wip_rows()), hide_index=True, use_container_width=True)
+    with s2:
+        st.markdown("#### Part-wise")
+        st.dataframe(pd.DataFrame(db.part_wip_rows()), hide_index=True, use_container_width=True)
+    with s3:
+        st.markdown("#### Customer-wise")
+        st.dataframe(pd.DataFrame(db.customer_wip_rows()), hide_index=True, use_container_width=True)
+
+with tabs[6]:
+    st.subheader("Schedule-Line Plan Quantity Calculation")
+    schedule_calc_df = pd.DataFrame(db.schedule_line_calculation_rows())
+    if schedule_calc_df.empty:
+        st.info("No schedules imported.")
+    else:
+        st.dataframe(schedule_calc_df, hide_index=True, use_container_width=True, height=520)
+        st.caption("First line: Demand + Minimum Stock - Opening Available. Further lines: Demand + Minimum Stock - Previous Schedule Carry-Forward WIP.")
+
+with tabs[7]:
+    st.subheader("Process-BOM-Wise WIP Allocation")
+    process_wip_df = pd.DataFrame(db.process_schedule_wip_rows())
+    if process_wip_df.empty:
+        st.info("No process WIP allocation available.")
+    else:
+        st.dataframe(process_wip_df, hide_index=True, use_container_width=True, height=520)
+
+with tabs[8]:
+    st.subheader("Saved Previous Operator Entries")
+    entries_df = pd.DataFrame([dict(r) for r in db.operator_entries()])
+    if entries_df.empty:
+        st.info("No saved entries.")
+    else:
+        st.dataframe(entries_df, hide_index=True, use_container_width=True, height=560)
+
+with tabs[9]:
+    st.subheader("Download Complete WIP Workbook")
+    if st.button("Prepare Downloadable Excel"):
+        export_path = BASE_DIR / "Electro_Dip_WIP_Report.xlsx"
+        db.export_wip_excel(export_path)
+        st.session_state["wip_export"] = export_path.read_bytes()
+    if "wip_export" in st.session_state:
         st.download_button(
-            "Download Filtered Production Progress CSV",
-            data=progress_view.to_csv(index=False).encode("utf-8"),
-            file_name=f"Production_Progress_{date.today().isoformat()}.csv",
-            mime="text/csv",
+            "Download WIP Excel",
+            st.session_state["wip_export"],
+            file_name="Electro_Dip_WIP_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
         )
-
-with data_tab:
-    st.subheader("Imported Master Data")
-    data_choice = st.selectbox(
-        "Select data table",
-        [
-            "customer_schedules", "stock_demand", "batch_config", "process_bom",
-            "machine_recommendations", "machine_downtime", "shifts", "breaks",
-            "holidays", "weekly_offs", "operators",
-        ],
-    )
-    master_df = pd.read_sql_query(
-        f"SELECT * FROM {data_choice} LIMIT 10000",
-        db.conn,
-    )
-    master_view = filter_and_sort_table(
-        master_df,
-        f"master_{data_choice}",
-        filter_columns=list(master_df.columns[:6]),
-        default_sort=master_df.columns[0] if len(master_df.columns) else None,
-    )
-    st.dataframe(
-        master_view,
-        hide_index=True,
-        use_container_width=True,
-        height=520,
-    )
-    st.download_button(
-        "Download Filtered Table CSV",
-        data=master_view.to_csv(index=False).encode("utf-8"),
-        file_name=f"{data_choice}_filtered.csv",
-        mime="text/csv",
+    st.write(
+        "Workbook sheets include Process WIP Report, WIP Ageing data, Machine WIP, Part WIP, Customer WIP, Dispatch History, Schedule Calculation, Production Plan and Operator Entries."
     )
 
-st.divider()
-st.caption(
-    "Session data is isolated in a temporary database on the server. For permanent multi-user storage, "
-    "connect the app to PostgreSQL or another managed database."
-)
+with tabs[10]:
+    st.subheader("Clear Previous Entries")
+    st.error(
+        "This is the only action that deletes saved operator entries and WIP history."
+    )
+    confirm = st.text_input('Type exactly: CLEAR ALL ENTRIES')
+    if st.button("Clear Previous Entries and Plan", type="primary"):
+        if confirm != "CLEAR ALL ENTRIES":
+            st.warning("Confirmation text does not match.")
+        else:
+            count = db.clear_previous_entries()
+            st.session_state.pop("wip_export", None)
+            st.success(f"{count} previous entries cleared. Production plan also cleared.")

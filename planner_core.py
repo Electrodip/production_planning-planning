@@ -1,46 +1,27 @@
-import json
+
+import io
 import math
-import os
 import sqlite3
-import traceback
-import subprocess
-import webbrowser
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.lib.pagesizes import A6, landscape
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.pdfgen import canvas
-from reportlab.platypus import Paragraph
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A6, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+import pandas as pd
+from openpyxl import load_workbook
+import xlsxwriter
 
 
-APP_NAME = "Electro-Dip Production Planner"
-DB_FILE = "electro_dip_planner.db"
-MAX_LOOKBACK_DAYS = 365
+def is_blank(value):
+    return value is None or str(value).strip() == ""
 
 
 def parse_date(value):
-    if value is None or value == "":
-        raise ValueError("Blank date")
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)):
+        return (datetime(1899, 12, 30) + timedelta(days=float(value))).date()
     text = str(value).strip()
     for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y"):
         try:
@@ -51,18 +32,15 @@ def parse_date(value):
 
 
 def parse_time(value):
-    if value is None or value == "":
-        raise ValueError("Blank time")
     if isinstance(value, datetime):
         return value.time().replace(second=0, microsecond=0)
     if isinstance(value, time):
         return value.replace(second=0, microsecond=0)
     if isinstance(value, (int, float)):
-        total_seconds = round((float(value) % 1) * 86400)
-        total_seconds %= 86400
-        return time(total_seconds // 3600, (total_seconds % 3600) // 60)
-    text = str(value).strip().replace(".", ":")
-    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I %p"):
+        seconds = round((float(value) % 1) * 86400) % 86400
+        return time(seconds // 3600, (seconds % 3600) // 60)
+    text = str(value).strip()
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p"):
         try:
             return datetime.strptime(text, fmt).time()
         except ValueError:
@@ -70,53 +48,27 @@ def parse_time(value):
     raise ValueError(f"Invalid time: {value}")
 
 
-def combine_date_time(date_value, time_value):
-    return datetime.combine(parse_date(date_value), parse_time(time_value))
+def combine_date_time(d, t):
+    return datetime.combine(parse_date(d), parse_time(t))
 
 
 class Database:
     def __init__(self, path):
-        self.path = path
-        self.conn = sqlite3.connect(path, timeout=30)
+        self.path = Path(path)
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.create_schema()
-        self.ensure_columns()
-
-
-    def ensure_columns(self):
-        """Add columns introduced in later versions without deleting user data."""
-        def columns(table):
-            return {
-                row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")
-            }
-
-        schedule_columns = columns("customer_schedules")
-        if "customer_name" not in schedule_columns:
-            self.conn.execute(
-                "ALTER TABLE customer_schedules "
-                "ADD COLUMN customer_name TEXT NOT NULL DEFAULT ''"
-            )
-
-        plan_columns = columns("production_plan")
-        if "customer_name" not in plan_columns:
-            self.conn.execute(
-                "ALTER TABLE production_plan "
-                "ADD COLUMN customer_name TEXT DEFAULT ''"
-            )
-
-        self.conn.commit()
 
     def close(self):
         self.conn.close()
 
     def create_schema(self):
-        sql = """
-        PRAGMA foreign_keys = ON;
+        self.conn.executescript("""
+        PRAGMA journal_mode=WAL;
 
         CREATE TABLE IF NOT EXISTS customer_schedules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            schedule_id TEXT NOT NULL,
-            customer_name TEXT NOT NULL DEFAULT '',
+            schedule_id TEXT PRIMARY KEY,
+            customer_name TEXT NOT NULL,
             part_name TEXT NOT NULL,
             customer_qty REAL NOT NULL,
             due_datetime TEXT NOT NULL,
@@ -132,8 +84,8 @@ class Database:
 
         CREATE TABLE IF NOT EXISTS batch_config (
             part_name TEXT PRIMARY KEY,
-            production_batch REAL NOT NULL,
-            transportation_batch REAL NOT NULL
+            production_batch REAL NOT NULL DEFAULT 0,
+            transportation_batch REAL NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS process_bom (
@@ -157,321 +109,159 @@ class Database:
             preference_order INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS machine_downtime (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_name TEXT NOT NULL,
-            start_datetime TEXT NOT NULL,
-            end_datetime TEXT NOT NULL,
-            reason TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shift_name TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS breaks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shift_name TEXT NOT NULL,
-            break_name TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS holidays (
-            holiday_date TEXT PRIMARY KEY,
-            holiday_name TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS weekly_offs (
-            day_number INTEGER PRIMARY KEY,
-            day_name TEXT NOT NULL,
-            is_off INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS operators (
-            operator_id TEXT PRIMARY KEY,
-            operator_name TEXT NOT NULL,
-            department TEXT DEFAULT '',
-            skill_group TEXT DEFAULT '',
-            shift_name TEXT DEFAULT '',
-            active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS production_plan (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plan_id TEXT,
-            schedule_id TEXT,
-            customer_name TEXT DEFAULT '',
-            shift_name TEXT,
-            machine_name TEXT,
-            operation_name TEXT,
-            part_name TEXT,
-            planned_qty REAL,
-            start_datetime TEXT,
-            end_datetime TEXT,
-            process_sequence INTEGER,
-            process_type TEXT,
-            due_datetime TEXT,
-            note TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS production_updates (
-            plan_id TEXT PRIMARY KEY,
-            schedule_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS operator_entries (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_date TEXT NOT NULL,
+            schedule_id TEXT DEFAULT '',
             customer_name TEXT DEFAULT '',
             part_name TEXT NOT NULL,
-            operation_name TEXT NOT NULL,
             process_sequence INTEGER NOT NULL,
+            operation_name TEXT NOT NULL,
             machine_name TEXT DEFAULT '',
             shift_name TEXT DEFAULT '',
-            report_date TEXT NOT NULL,
             planned_qty REAL NOT NULL DEFAULT 0,
             actual_qty REAL NOT NULL DEFAULT 0,
             rejected_qty REAL NOT NULL DEFAULT 0,
             good_qty REAL NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Not Started',
+            status TEXT DEFAULT '',
             operator_name TEXT DEFAULT '',
             supervisor_name TEXT DEFAULT '',
             remarks TEXT DEFAULT '',
-            updated_at TEXT NOT NULL
+            source TEXT DEFAULT 'MANUAL',
+            created_at TEXT NOT NULL
         );
-        """
-        self.conn.executescript(sql)
+
+        CREATE TABLE IF NOT EXISTS production_plan (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id TEXT NOT NULL,
+            requirement_type TEXT NOT NULL,
+            schedule_id TEXT DEFAULT '',
+            customer_name TEXT DEFAULT '',
+            part_name TEXT NOT NULL,
+            process_sequence INTEGER NOT NULL,
+            operation_name TEXT NOT NULL,
+            machine_name TEXT DEFAULT '',
+            shift_name TEXT DEFAULT '',
+            planned_qty REAL NOT NULL,
+            lot_no INTEGER NOT NULL,
+            due_datetime TEXT,
+            note TEXT DEFAULT ''
+        );
+        """)
         self.conn.commit()
 
     def clear_master_data(self):
-        tables = [
-            "customer_schedules", "stock_demand", "batch_config", "process_bom",
-            "machine_recommendations", "machine_downtime", "shifts", "breaks",
-            "holidays", "weekly_offs", "operators", "production_plan"
-        ]
         with self.conn:
-            for table in tables:
+            for table in (
+                "customer_schedules", "stock_demand", "batch_config",
+                "process_bom", "machine_recommendations", "production_plan"
+            ):
                 self.conn.execute(f"DELETE FROM {table}")
 
     def clear_plan(self):
         with self.conn:
-            count = self.conn.execute("SELECT COUNT(*) FROM production_plan").fetchone()[0]
+            count = self.conn.execute(
+                "SELECT COUNT(*) FROM production_plan"
+            ).fetchone()[0]
             self.conn.execute("DELETE FROM production_plan")
         return count
 
-    def import_workbook(self, file_path):
-        """
-        Import valid rows and skip incomplete placeholder rows.
+    def clear_previous_entries(self):
+        with self.conn:
+            count = self.conn.execute(
+                "SELECT COUNT(*) FROM operator_entries"
+            ).fetchone()[0]
+            self.conn.execute("DELETE FROM operator_entries")
+            self.conn.execute("DELETE FROM production_plan")
+        return count
 
-        Returns a report dictionary with record counts and warnings.
-        Missing required worksheets remain a fatal error.
-        """
-        workbook = load_workbook(file_path, data_only=True, read_only=True)
+    @staticmethod
+    def _iter_rows(ws, max_blank_run=100):
+        blank_run = 0
+        for row_no, row in enumerate(
+            ws.iter_rows(min_row=3, values_only=True), start=3
+        ):
+            if all(is_blank(v) for v in row):
+                blank_run += 1
+                if blank_run >= max_blank_run:
+                    break
+                continue
+            blank_run = 0
+            yield row_no, row
+
+    def import_workbook(self, source):
+        wb = load_workbook(source, data_only=True, read_only=True)
         required = [
-            "Customer_Schedules", "Stock_Demand", "Batch_Config", "Process_BOM",
-            "Machine_Recommendations", "Machine_Downtime", "Shifts", "Breaks",
-            "Holidays", "Weekly_Offs"
+            "Customer_Schedules", "Stock_Demand", "Batch_Config",
+            "Process_BOM", "Machine_Recommendations"
         ]
-        missing = [name for name in required if name not in workbook.sheetnames]
+        missing = [s for s in required if s not in wb.sheetnames]
         if missing:
             raise ValueError("Missing worksheets: " + ", ".join(missing))
 
-        report = {
-            "counts": {
-                "Customer Schedules": 0,
-                "Stock Records": 0,
-                "Batch Configurations": 0,
-                "Process BOM Operations": 0,
-                "Machine Recommendations": 0,
-                "Machine Downtime": 0,
-                "Shifts": 0,
-                "Breaks": 0,
-                "Holidays": 0,
-                "Weekly Off Rows": 0,
-                "Operators": 0,
-            },
-            "blank_rows_skipped": 0,
-            "placeholder_rows_skipped": 0,
-            "operations_without_machines": 0,
-            "warning_count": 0,
-            "warnings": [],
-        }
+        counts = defaultdict(int)
+        warnings = []
 
-        def is_blank(value):
-            return value is None or str(value).strip() == ""
+        # Master data is replaced, but operator entries are intentionally preserved.
+        self.clear_master_data()
 
-        def row_is_blank(row):
-            return all(is_blank(value) for value in row)
-
-        def iter_data_rows(ws, min_row=3, blank_row_limit=100):
-            """Yield data rows and stop after a long blank tail.
-
-            This prevents formatted Excel sheets from being interpreted as
-            having hundreds of thousands of records.
-            """
-            consecutive_blank = 0
-            for row_number, row in enumerate(
-                ws.iter_rows(min_row=min_row, values_only=True),
-                start=min_row,
-            ):
-                if row_is_blank(row):
-                    consecutive_blank += 1
-                    report["blank_rows_skipped"] += 1
-                    if consecutive_blank >= blank_row_limit:
-                        break
-                    continue
-                consecutive_blank = 0
-                yield row_number, row
-
-        def to_float(value, default=0.0):
-            if is_blank(value):
-                return float(default)
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return float(default)
-
-        def to_int(value, default=0):
-            if is_blank(value):
-                return int(default)
-            try:
-                return int(float(value))
-            except (TypeError, ValueError):
-                return int(default)
-
-        def warn(sheet_name, row_number, message):
-            report["warning_count"] += 1
-            # Keep only a practical preview in memory and in the dialog.
-            if len(report["warnings"]) < 100:
-                report["warnings"].append(
-                    f"{sheet_name}, row {row_number}: {message}"
-                )
-
-        # Import is atomic: a database error rolls everything back.
         with self.conn:
-            self.clear_master_data()
-
-            # ---------------- Customer Schedules ----------------
-            ws = workbook["Customer_Schedules"]
-            for row_number, row in iter_data_rows(ws):
-
-                if is_blank(row[0]) or is_blank(row[1]) or is_blank(row[2]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Schedule ID, Customer Name and Part Name are required."
-                    )
-                    continue
-
-                if to_float(row[3], 0) <= 0:
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Customer Required Qty must be greater than zero."
-                    )
-                    continue
-
-                if is_blank(row[4]) or is_blank(row[5]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: delivery date or delivery time is blank."
-                    )
-                    continue
-
+            ws = wb["Customer_Schedules"]
+            for r, row in self._iter_rows(ws):
                 try:
+                    if any(is_blank(row[i]) for i in (0, 1, 2, 3, 4, 5)):
+                        warnings.append(f"Customer_Schedules row {r}: incomplete row skipped")
+                        continue
                     due = combine_date_time(row[4], row[5])
-                except ValueError as exc:
-                    warn(ws.title, row_number, f"Skipped: {exc}")
-                    continue
-
-                self.conn.execute(
-                    """INSERT INTO customer_schedules
-                    (schedule_id, customer_name, part_name, customer_qty,
-                     due_datetime, priority)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        str(row[0]).strip(),
-                        str(row[1]).strip(),
-                        str(row[2]).strip(),
-                        to_float(row[3], 0),
-                        due.isoformat(sep=" "),
-                        to_int(row[6], 999),
+                    self.conn.execute(
+                        """INSERT OR REPLACE INTO customer_schedules
+                        (schedule_id, customer_name, part_name, customer_qty,
+                         due_datetime, priority)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(row[0]).strip(), str(row[1]).strip(),
+                            str(row[2]).strip(), float(row[3]),
+                            due.isoformat(sep=" "), int(float(row[6] or 999))
+                        )
                     )
-                )
-                report["counts"]["Customer Schedules"] += 1
+                    counts["Customer Schedules"] += 1
+                except Exception as exc:
+                    warnings.append(f"Customer_Schedules row {r}: {exc}")
 
-            # ---------------- Stock Demand ----------------
-            ws = workbook["Stock_Demand"]
-            for row_number, row in iter_data_rows(ws):
+            ws = wb["Stock_Demand"]
+            for r, row in self._iter_rows(ws):
                 if is_blank(row[0]):
-                    warn(ws.title, row_number, "Skipped: Part Name is blank.")
                     continue
-
                 self.conn.execute(
                     """INSERT OR REPLACE INTO stock_demand
                     (part_name, current_stock, minimum_stock, remarks)
                     VALUES (?, ?, ?, ?)""",
                     (
-                        str(row[0]).strip(),
-                        to_float(row[1], 0),
-                        to_float(row[2], 0),
-                        str(row[3] or ""),
+                        str(row[0]).strip(), float(row[1] or 0),
+                        float(row[2] or 0), str(row[3] or "")
                     )
                 )
-                report["counts"]["Stock Records"] += 1
+                counts["Stock Records"] += 1
 
-            # ---------------- Batch Configuration ----------------
-            ws = workbook["Batch_Config"]
-            for row_number, row in iter_data_rows(ws):
+            ws = wb["Batch_Config"]
+            for r, row in self._iter_rows(ws):
                 if is_blank(row[0]):
-                    warn(ws.title, row_number, "Skipped: Part Name is blank.")
                     continue
-
-                production_batch = to_float(row[1], 0)
-                transportation_batch = to_float(row[2], 0)
-                if production_batch <= 0 or transportation_batch <= 0:
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: production and transportation batch quantities must be greater than zero."
-                    )
-                    continue
-
                 self.conn.execute(
                     """INSERT OR REPLACE INTO batch_config
                     (part_name, production_batch, transportation_batch)
                     VALUES (?, ?, ?)""",
                     (
-                        str(row[0]).strip(),
-                        production_batch,
-                        transportation_batch,
+                        str(row[0]).strip(), float(row[1] or 0),
+                        float(row[2] or 0)
                     )
                 )
-                report["counts"]["Batch Configurations"] += 1
+                counts["Batch Configurations"] += 1
 
-            # ---------------- Process BOM ----------------
-            ws = workbook["Process_BOM"]
-            for row_number, row in iter_data_rows(ws):
-                if is_blank(row[0]) or is_blank(row[2]) or is_blank(row[3]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Part Name, Operation Name and Process Type are required."
-                    )
+            ws = wb["Process_BOM"]
+            for r, row in self._iter_rows(ws):
+                if is_blank(row[0]) or is_blank(row[1]) or is_blank(row[2]):
                     continue
-
-                process_type = str(row[3]).strip().upper()
-                if process_type not in ("INHOUSE", "OUTSOURCE"):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Process Type must be INHOUSE or OUTSOURCE."
-                    )
-                    continue
-
-                sequence = to_int(row[1], 0)
-                if sequence <= 0:
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Process Sequence must be greater than zero."
-                    )
-                    continue
-
                 self.conn.execute(
                     """INSERT INTO process_bom
                     (part_name, process_sequence, operation_name, process_type,
@@ -479,31 +269,20 @@ class Database:
                      qty_multiplier, scrap_allowance)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        str(row[0]).strip(),
-                        sequence,
-                        str(row[2]).strip(),
-                        process_type,
-                        to_float(row[4], 0),
-                        to_float(row[5], 0),
-                        to_float(row[6], 0),
-                        max(to_float(row[7], 1), 1),
-                        to_float(row[8], 0),
+                        str(row[0]).strip(), int(float(row[1])),
+                        str(row[2]).strip(), str(row[3] or "INHOUSE").strip().upper(),
+                        float(row[4] or 0), float(row[5] or 0),
+                        float(row[6] or 0), max(float(row[7] or 1), 1),
+                        float(row[8] or 0)
                     )
                 )
-                report["counts"]["Process BOM Operations"] += 1
+                counts["Process BOM Operations"] += 1
 
-            # ---------------- Machine Recommendations ----------------
-            ws = workbook["Machine_Recommendations"]
-            for row_number, row in iter_data_rows(ws):
+            ws = wb["Machine_Recommendations"]
+            for r, row in self._iter_rows(ws):
                 if is_blank(row[0]) or is_blank(row[1]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Part Name and Operation Name are required."
-                    )
                     continue
-
-                machines_added = 0
-                for order, machine in enumerate(row[2:17], start=1):
+                for pref, machine in enumerate(row[2:17], start=1):
                     if is_blank(machine):
                         continue
                     self.conn.execute(
@@ -511,1285 +290,588 @@ class Database:
                         (part_name, operation_name, machine_name, preference_order)
                         VALUES (?, ?, ?, ?)""",
                         (
-                            str(row[0]).strip(),
-                            str(row[1]).strip(),
-                            str(machine).strip(),
-                            order,
+                            str(row[0]).strip(), str(row[1]).strip(),
+                            str(machine).strip(), pref
                         )
                     )
-                    machines_added += 1
-                    report["counts"]["Machine Recommendations"] += 1
+                    counts["Machine Recommendations"] += 1
 
-                if machines_added == 0:
-                    report["operations_without_machines"] += 1
-                    warn(
-                        ws.title, row_number,
-                        "No machine entered in Machine 1 to Machine 15."
-                    )
-
-            # ---------------- Machine Downtime ----------------
-            ws = workbook["Machine_Downtime"]
-            for row_number, row in iter_data_rows(ws):
-
-                # A machine name without dates is a placeholder/master-list row.
-                if not is_blank(row[0]) and all(is_blank(row[i]) for i in (1, 2, 3, 4)):
-                    # Machine master/placeholder row, not a downtime record.
-                    report["placeholder_rows_skipped"] += 1
-                    continue
-
-                if is_blank(row[0]):
-                    warn(ws.title, row_number, "Skipped: Machine Name is blank.")
-                    continue
-
-                if any(is_blank(row[i]) for i in (1, 2, 3, 4)):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: downtime start/end date and time must all be entered."
-                    )
-                    continue
-
-                try:
-                    start_dt = combine_date_time(row[1], row[2])
-                    end_dt = combine_date_time(row[3], row[4])
-                except ValueError as exc:
-                    warn(ws.title, row_number, f"Skipped: {exc}")
-                    continue
-
-                if end_dt <= start_dt:
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: downtime end must be after downtime start."
-                    )
-                    continue
-
-                self.conn.execute(
-                    """INSERT INTO machine_downtime
-                    (machine_name, start_datetime, end_datetime, reason)
-                    VALUES (?, ?, ?, ?)""",
-                    (
-                        str(row[0]).strip(),
-                        start_dt.isoformat(sep=" "),
-                        end_dt.isoformat(sep=" "),
-                        str(row[5] or ""),
-                    )
-                )
-                report["counts"]["Machine Downtime"] += 1
-
-            # ---------------- Shifts ----------------
-            ws = workbook["Shifts"]
-            for row_number, row in iter_data_rows(ws):
-                if is_blank(row[0]):
-                    warn(ws.title, row_number, "Skipped: Shift Name is blank.")
-                    continue
-                if is_blank(row[1]) or is_blank(row[2]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: shift start or end time is blank."
-                    )
-                    continue
-                try:
-                    start_time = parse_time(row[1]).strftime("%H:%M")
-                    end_time = parse_time(row[2]).strftime("%H:%M")
-                except ValueError as exc:
-                    warn(ws.title, row_number, f"Skipped: {exc}")
-                    continue
-
-                self.conn.execute(
-                    """INSERT INTO shifts
-                    (shift_name, start_time, end_time, active)
-                    VALUES (?, ?, ?, ?)""",
-                    (
-                        str(row[0]).strip(),
-                        start_time,
-                        end_time,
-                        1 if str(row[3]).strip().upper() == "Y" else 0,
-                    )
-                )
-                report["counts"]["Shifts"] += 1
-
-            # ---------------- Breaks ----------------
-            ws = workbook["Breaks"]
-            for row_number, row in iter_data_rows(ws):
-                if is_blank(row[0]) or is_blank(row[1]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Shift Name and Break Name are required."
-                    )
-                    continue
-                if is_blank(row[2]) or is_blank(row[3]):
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: break start or end time is blank."
-                    )
-                    continue
-                try:
-                    start_time = parse_time(row[2]).strftime("%H:%M")
-                    end_time = parse_time(row[3]).strftime("%H:%M")
-                except ValueError as exc:
-                    warn(ws.title, row_number, f"Skipped: {exc}")
-                    continue
-
-                self.conn.execute(
-                    """INSERT INTO breaks
-                    (shift_name, break_name, start_time, end_time)
-                    VALUES (?, ?, ?, ?)""",
-                    (
-                        str(row[0]).strip(),
-                        str(row[1]).strip(),
-                        start_time,
-                        end_time,
-                    )
-                )
-                report["counts"]["Breaks"] += 1
-
-            # ---------------- Holidays ----------------
-            ws = workbook["Holidays"]
-            for row_number, row in iter_data_rows(ws):
-                if is_blank(row[0]):
-                    warn(ws.title, row_number, "Skipped: Holiday Date is blank.")
-                    continue
-                try:
-                    holiday_date = parse_date(row[0]).isoformat()
-                except ValueError as exc:
-                    warn(ws.title, row_number, f"Skipped: {exc}")
-                    continue
-
-                self.conn.execute(
-                    """INSERT OR REPLACE INTO holidays
-                    (holiday_date, holiday_name)
-                    VALUES (?, ?)""",
-                    (holiday_date, str(row[1] or ""))
-                )
-                report["counts"]["Holidays"] += 1
-
-            # ---------------- Weekly Offs ----------------
-            ws = workbook["Weekly_Offs"]
-            for row_number, row in iter_data_rows(ws):
-                day_number = to_int(row[0], 0)
-                if day_number < 1 or day_number > 7:
-                    warn(
-                        ws.title, row_number,
-                        "Skipped: Day Number must be between 1 and 7."
-                    )
-                    continue
-
-                self.conn.execute(
-                    """INSERT OR REPLACE INTO weekly_offs
-                    (day_number, day_name, is_off)
-                    VALUES (?, ?, ?)""",
-                    (
-                        day_number,
-                        str(row[1] or "").strip(),
-                        1 if str(row[2]).strip().upper() == "Y" else 0,
-                    )
-                )
-                report["counts"]["Weekly Off Rows"] += 1
-
-            # ---------------- Operators ----------------
-            if "Operators" in workbook.sheetnames:
-                ws = workbook["Operators"]
-                for row_number, row in iter_data_rows(ws):
-                    if is_blank(row[0]) or is_blank(row[1]):
-                        warn(
-                            ws.title, row_number,
-                            "Skipped: Operator ID and Operator Name are required."
-                        )
-                        continue
-
-                    active_value = str(row[5] or "Y").strip().upper()
-                    self.conn.execute(
-                        """INSERT OR REPLACE INTO operators
-                        (operator_id, operator_name, department,
-                         skill_group, shift_name, active)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            str(row[0]).strip(),
-                            str(row[1]).strip(),
-                            str(row[2] or "").strip(),
-                            str(row[3] or "").strip(),
-                            str(row[4] or "").strip(),
-                            1 if active_value in ("Y", "YES", "1", "TRUE") else 0,
-                        )
-                    )
-                    report["counts"]["Operators"] += 1
-            else:
-                warn(
-                    "Operators", 0,
-                    "Operators worksheet is missing. Operator dropdown will be empty."
-                )
-
-        workbook.close()
-        return report
-
-
-    def active_operator_names(self, shift_name=None):
-        """Return active operator names, optionally filtered by shift."""
-        if shift_name:
-            rows = self.conn.execute(
-                """SELECT operator_name FROM operators
-                   WHERE active = 1
-                     AND (TRIM(shift_name) = '' OR shift_name = ?)
-                   ORDER BY operator_name""",
-                (shift_name,),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                """SELECT operator_name FROM operators
-                   WHERE active = 1
-                   ORDER BY operator_name"""
-            ).fetchall()
-        return [str(row["operator_name"]) for row in rows]
-
-
-    def validate(self):
-        errors = []
-        schedule_count = self.conn.execute("SELECT COUNT(*) FROM customer_schedules").fetchone()[0]
-        if schedule_count == 0:
-            errors.append("No customer schedules imported.")
-
-        active_shift_count = self.conn.execute(
-            "SELECT COUNT(*) FROM shifts WHERE active = 1"
-        ).fetchone()[0]
-        if active_shift_count == 0:
-            errors.append("No active shifts configured.")
-
-        rows = self.conn.execute(
-            """SELECT part_name, operation_name, process_type
-               FROM process_bom"""
-        ).fetchall()
-        for row in rows:
-            if row["process_type"] not in ("INHOUSE", "OUTSOURCE"):
-                errors.append(
-                    f"Invalid process type for {row['part_name']} / {row['operation_name']}."
-                )
-            if row["process_type"] == "INHOUSE":
-                count = self.conn.execute(
-                    """SELECT COUNT(*) FROM machine_recommendations
-                       WHERE part_name = ? AND operation_name = ?""",
-                    (row["part_name"], row["operation_name"])
+            if "Opening_WIP" in wb.sheetnames:
+                ws = wb["Opening_WIP"]
+                existing = self.conn.execute(
+                    "SELECT COUNT(*) FROM operator_entries"
                 ).fetchone()[0]
-                if count == 0:
-                    errors.append(
-                        f"No recommended machine for {row['part_name']} / {row['operation_name']}."
+                # Opening WIP is imported only when no previous entries exist.
+                if existing == 0:
+                    for r, row in self._iter_rows(ws):
+                        if is_blank(row[0]) or is_blank(row[1]) or is_blank(row[2]):
+                            continue
+                        actual = float(row[4] or 0)
+                        rejected = float(row[5] or 0)
+                        good = float(row[6] if not is_blank(row[6]) else max(actual-rejected, 0))
+                        self.conn.execute(
+                            """INSERT INTO operator_entries
+                            (entry_date, part_name, process_sequence, operation_name,
+                             machine_name, actual_qty, rejected_qty, good_qty,
+                             operator_name, remarks, source, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPENING_WIP', ?)""",
+                            (
+                                parse_date(row[0]).isoformat(),
+                                str(row[1]).strip(), int(float(row[2])),
+                                str(row[3] or "").strip(), str(row[7] or "").strip(),
+                                actual, rejected, good, str(row[8] or "").strip(),
+                                str(row[9] or "").strip(),
+                                datetime.now().isoformat(sep=" ", timespec="seconds")
+                            )
+                        )
+                        counts["Opening WIP Entries"] += 1
+                else:
+                    warnings.append(
+                        "Opening_WIP was not re-imported because previous operator entries already exist."
                     )
-        return errors
 
-    def save_production_updates(self, records, report_date):
-        """Save operator-entered quantities without deleting earlier progress."""
-        report_date = parse_date(report_date).isoformat()
-        saved = 0
+        wb.close()
+        return {
+            "counts": dict(counts),
+            "warnings": warnings,
+            "previous_entries_preserved": self.conn.execute(
+                "SELECT COUNT(*) FROM operator_entries"
+            ).fetchone()[0],
+        }
+
+    def add_operator_entry(
+        self, entry_date, part_name, process_sequence, operation_name,
+        actual_qty, rejected_qty, machine_name="", shift_name="",
+        schedule_id="", customer_name="", planned_qty=0, status="",
+        operator_name="", supervisor_name="", remarks=""
+    ):
+        actual = max(float(actual_qty or 0), 0)
+        rejected = max(float(rejected_qty or 0), 0)
+        good = max(actual - rejected, 0)
         with self.conn:
-            for record in records:
-                plan_id = str(record.get("plan_id") or "").strip()
-                if not plan_id or plan_id == "EXCEPTION":
-                    continue
-                actual = max(float(record.get("actual_qty") or 0), 0)
-                rejected = max(float(record.get("rejected_qty") or 0), 0)
-                rejected = min(rejected, actual)
-                good = max(actual - rejected, 0)
-                status = str(record.get("status") or "Not Started").strip()
-                if status not in ("Not Started", "Running", "Completed", "Hold", "Rework"):
-                    status = "Not Started"
-                self.conn.execute(
-                    """INSERT INTO production_updates
-                    (plan_id, schedule_id, customer_name, part_name,
-                     operation_name, process_sequence, machine_name, shift_name,
-                     report_date, planned_qty, actual_qty, rejected_qty, good_qty,
-                     status, operator_name, supervisor_name, remarks, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(plan_id) DO UPDATE SET
-                        report_date=excluded.report_date,
-                        actual_qty=excluded.actual_qty,
-                        rejected_qty=excluded.rejected_qty,
-                        good_qty=excluded.good_qty,
-                        status=excluded.status,
-                        operator_name=excluded.operator_name,
-                        supervisor_name=excluded.supervisor_name,
-                        remarks=excluded.remarks,
-                        updated_at=excluded.updated_at""",
-                    (
-                        plan_id,
-                        str(record.get("schedule_id") or ""),
-                        str(record.get("customer_name") or ""),
-                        str(record.get("part_name") or ""),
-                        str(record.get("operation_name") or ""),
-                        int(float(record.get("process_sequence") or 0)),
-                        str(record.get("machine_name") or ""),
-                        str(record.get("shift_name") or ""),
-                        report_date,
-                        float(record.get("planned_qty") or 0),
-                        actual,
-                        rejected,
-                        good,
-                        status,
-                        str(record.get("operator_name") or ""),
-                        str(record.get("supervisor_name") or ""),
-                        str(record.get("remarks") or ""),
-                        datetime.now().isoformat(sep=" ", timespec="seconds"),
-                    ),
+            self.conn.execute(
+                """INSERT INTO operator_entries
+                (entry_date, schedule_id, customer_name, part_name,
+                 process_sequence, operation_name, machine_name, shift_name,
+                 planned_qty, actual_qty, rejected_qty, good_qty, status,
+                 operator_name, supervisor_name, remarks, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?)""",
+                (
+                    parse_date(entry_date).isoformat(), str(schedule_id or ""),
+                    str(customer_name or ""), str(part_name).strip(),
+                    int(process_sequence), str(operation_name).strip(),
+                    str(machine_name or ""), str(shift_name or ""),
+                    float(planned_qty or 0), actual, rejected, good,
+                    str(status or ""), str(operator_name or ""),
+                    str(supervisor_name or ""), str(remarks or ""),
+                    datetime.now().isoformat(sep=" ", timespec="seconds")
                 )
-                saved += 1
-        return saved
+            )
+        return good
 
-    def production_progress_rows(self):
+    def operator_entries(self):
         return self.conn.execute(
-            """SELECT * FROM production_updates
-               ORDER BY report_date DESC, machine_name, process_sequence"""
+            """SELECT * FROM operator_entries
+               ORDER BY entry_date DESC, entry_id DESC"""
         ).fetchall()
 
-    def completed_good_qty(self, schedule_id, part_name):
-        """Accepted output at the last in-house process; used to reduce re-planning."""
-        final_row = self.conn.execute(
-            """SELECT MAX(process_sequence) AS final_sequence
-               FROM process_bom
-               WHERE part_name = ? AND process_type = 'INHOUSE'""",
-            (part_name,),
+    def bom_rows(self):
+        return self.conn.execute(
+            """SELECT * FROM process_bom
+               ORDER BY part_name, process_sequence"""
+        ).fetchall()
+
+    def part_final_sequence(self, part_name):
+        row = self.conn.execute(
+            """SELECT MAX(process_sequence) AS seq
+               FROM process_bom WHERE part_name=?""",
+            (part_name,)
         ).fetchone()
-        final_sequence = final_row["final_sequence"] if final_row else None
-        if final_sequence is None:
+        return int(row["seq"]) if row and row["seq"] is not None else None
+
+    def process_cumulative_good(self, part_name):
+        rows = self.conn.execute(
+            """SELECT process_sequence, SUM(good_qty) AS good
+               FROM operator_entries
+               WHERE part_name=?
+               GROUP BY process_sequence""",
+            (part_name,)
+        ).fetchall()
+        return {int(r["process_sequence"]): float(r["good"] or 0) for r in rows}
+
+    def wip_rows(self):
+        """
+        Return physical WIP by process.
+
+        Daily entries are cumulative good quantities. To remain physically
+        consistent, an upstream process can never have less cumulative output
+        than a downstream process. Missing intermediate entries are therefore
+        normalized from downstream to upstream before WIP is calculated.
+        """
+        output = []
+        parts = self.conn.execute(
+            "SELECT DISTINCT part_name FROM process_bom ORDER BY part_name"
+        ).fetchall()
+        for part_row in parts:
+            part = part_row["part_name"]
+            bom = self.conn.execute(
+                """SELECT process_sequence, operation_name
+                   FROM process_bom WHERE part_name=?
+                   ORDER BY process_sequence""",
+                (part,)
+            ).fetchall()
+            raw_good = self.process_cumulative_good(part)
+
+            effective = {}
+            downstream_floor = 0.0
+            for row in reversed(bom):
+                seq = int(row["process_sequence"])
+                downstream_floor = max(raw_good.get(seq, 0.0), downstream_floor)
+                effective[seq] = downstream_floor
+
+            for idx, row in enumerate(bom):
+                seq = int(row["process_sequence"])
+                cumulative = effective.get(seq, 0.0)
+                if idx + 1 < len(bom):
+                    next_seq = int(bom[idx+1]["process_sequence"])
+                    next_cumulative = effective.get(next_seq, 0.0)
+                    wip = max(cumulative - next_cumulative, 0.0)
+                else:
+                    wip = 0.0
+
+                output.append({
+                    "part_name": part,
+                    "process_sequence": seq,
+                    "operation_name": row["operation_name"],
+                    "reported_cumulative_good_qty": raw_good.get(seq, 0.0),
+                    "normalized_cumulative_good_qty": cumulative,
+                    "wip_after_process": wip,
+                    "is_dispatch_sequence": idx == len(bom)-1,
+                })
+        return output
+
+    def total_dispatched_by_part(self, part_name):
+        final_seq = self.part_final_sequence(part_name)
+        if final_seq is None:
             return 0.0
         row = self.conn.execute(
-            """SELECT COALESCE(SUM(good_qty), 0) AS completed_qty
-               FROM production_updates
-               WHERE schedule_id = ? AND part_name = ?
-                 AND process_sequence = ? AND actual_qty > 0""",
-            (schedule_id, part_name, final_sequence),
+            """SELECT COALESCE(SUM(good_qty),0) AS qty
+               FROM operator_entries
+               WHERE part_name=? AND process_sequence=?""",
+            (part_name, final_seq)
         ).fetchone()
-        return float(row["completed_qty"] or 0)
+        return float(row["qty"] or 0)
 
-    def revised_quantity_rows(self):
-        """Return schedule-wise original, produced and revised quantities."""
+    def schedule_balance_rows(self):
         rows = []
-        schedules = self.conn.execute(
-            """SELECT * FROM customer_schedules
-               ORDER BY due_datetime, priority"""
+        parts = self.conn.execute(
+            """SELECT DISTINCT part_name
+               FROM customer_schedules ORDER BY part_name"""
         ).fetchall()
 
-        for schedule in schedules:
-            part_name = schedule["part_name"]
+        for part_row in parts:
+            part = part_row["part_name"]
+            schedules = self.conn.execute(
+                """SELECT * FROM customer_schedules
+                   WHERE part_name=?
+                   ORDER BY due_datetime, priority, schedule_id""",
+                (part,)
+            ).fetchall()
             stock = self.conn.execute(
-                "SELECT * FROM stock_demand WHERE part_name = ?",
-                (part_name,),
+                "SELECT * FROM stock_demand WHERE part_name=?",
+                (part,)
             ).fetchone()
-
             current_stock = float(stock["current_stock"] or 0) if stock else 0.0
             minimum_stock = float(stock["minimum_stock"] or 0) if stock else 0.0
-            original_net = max(
-                float(schedule["customer_qty"] or 0)
-                + minimum_stock
-                - current_stock,
-                0.0,
-            )
-            accepted = self.completed_good_qty(
-                schedule["schedule_id"], part_name
-            )
-            revised = max(original_net - accepted, 0.0)
+            dispatched_pool = self.total_dispatched_by_part(part)
+            stock_pool = current_stock
 
+            for sch in schedules:
+                demand = float(sch["customer_qty"] or 0)
+                stock_alloc = min(stock_pool, demand)
+                stock_pool -= stock_alloc
+                after_stock = demand - stock_alloc
+                dispatch_alloc = min(dispatched_pool, after_stock)
+                dispatched_pool -= dispatch_alloc
+                remaining = max(after_stock - dispatch_alloc, 0)
+                rows.append({
+                    "requirement_type": "CUSTOMER",
+                    "schedule_id": sch["schedule_id"],
+                    "customer_name": sch["customer_name"],
+                    "part_name": part,
+                    "due_datetime": sch["due_datetime"],
+                    "customer_demand": demand,
+                    "allocated_current_stock": stock_alloc,
+                    "allocated_dispatch_qty": dispatch_alloc,
+                    "minimum_stock_qty": 0.0,
+                    "revised_requirement": remaining,
+                    "priority": sch["priority"],
+                })
+
+            # Minimum stock is added once, only after all customer schedules.
+            remaining_stock_for_min = stock_pool
+            remaining_dispatch_for_min = dispatched_pool
+            min_after_stock = max(minimum_stock - remaining_stock_for_min, 0)
+            min_after_dispatch = max(min_after_stock - remaining_dispatch_for_min, 0)
             rows.append({
-                "schedule_id": schedule["schedule_id"],
-                "customer_name": schedule["customer_name"],
-                "part_name": part_name,
-                "customer_required_qty": float(schedule["customer_qty"] or 0),
-                "minimum_stock": minimum_stock,
-                "current_stock": current_stock,
-                "original_net_requirement": original_net,
-                "accepted_produced_qty": accepted,
-                "revised_plan_qty": revised,
-                "due_datetime": schedule["due_datetime"],
-                "priority": schedule["priority"],
+                "requirement_type": "MINIMUM_STOCK",
+                "schedule_id": f"MIN-STOCK-{part}",
+                "customer_name": "",
+                "part_name": part,
+                "due_datetime": None,
+                "customer_demand": 0.0,
+                "allocated_current_stock": min(remaining_stock_for_min, minimum_stock),
+                "allocated_dispatch_qty": min(remaining_dispatch_for_min, min_after_stock),
+                "minimum_stock_qty": minimum_stock,
+                "revised_requirement": min_after_dispatch,
+                "priority": 9999,
             })
-
         return rows
 
+    def downstream_available_qty(self, part_name, process_sequence):
+        """
+        Physical WIP already completed at this process or downstream,
+        excluding dispatched quantity because dispatch is already deducted
+        from customer schedules.
+        """
+        return sum(
+            float(row["wip_after_process"] or 0)
+            for row in self.wip_rows()
+            if row["part_name"] == part_name
+            and int(row["process_sequence"]) >= int(process_sequence)
+            and not row["is_dispatch_sequence"]
+        )
 
-    def generate_plan(self):
-        errors = self.validate()
-        if errors:
-            raise ValueError("\n".join(errors))
 
-        schedules = self.conn.execute(
-            """SELECT * FROM customer_schedules
-               ORDER BY due_datetime, priority"""
+    def opening_wip_total(self, part_name):
+        return sum(
+            float(row["wip_after_process"] or 0)
+            for row in self.wip_rows()
+            if row["part_name"] == part_name
+            and not row["is_dispatch_sequence"]
+        )
+
+    def schedule_line_calculation_rows(self):
+        """Apply first-line and further-line WIP rules part-wise and FIFO."""
+        results = []
+        part_rows = self.conn.execute(
+            """SELECT DISTINCT part_name FROM customer_schedules
+               ORDER BY part_name"""
         ).fetchall()
 
-        shifts = [
-            (r["shift_name"], parse_time(r["start_time"]), parse_time(r["end_time"]))
-            for r in self.conn.execute("SELECT * FROM shifts WHERE active = 1")
-        ]
-        break_map = defaultdict(list)
-        for r in self.conn.execute("SELECT * FROM breaks"):
-            break_map[r["shift_name"]].append(
-                (parse_time(r["start_time"]), parse_time(r["end_time"]))
-            )
-        holidays = {
-            parse_date(r["holiday_date"])
-            for r in self.conn.execute("SELECT holiday_date FROM holidays")
+        for part_row in part_rows:
+            part = part_row["part_name"]
+            schedules = self.conn.execute(
+                """SELECT * FROM customer_schedules
+                   WHERE part_name=?
+                   ORDER BY due_datetime, priority, schedule_id""",
+                (part,)
+            ).fetchall()
+            stock = self.conn.execute(
+                "SELECT * FROM stock_demand WHERE part_name=?", (part,)
+            ).fetchone()
+            minimum_stock = float(stock["minimum_stock"] or 0) if stock else 0.0
+            current_stock = float(stock["current_stock"] or 0) if stock else 0.0
+            opening_wip = self.opening_wip_total(part)
+            dispatched = self.total_dispatched_by_part(part)
+            carry_forward = max(current_stock + opening_wip + dispatched, 0.0)
+
+            for line_no, schedule in enumerate(schedules, start=1):
+                demand = float(schedule["customer_qty"] or 0)
+                gross_requirement = demand + minimum_stock
+                available_before = carry_forward
+                wip_used = min(available_before, gross_requirement)
+                plan_qty = max(gross_requirement - wip_used, 0.0)
+                carry_forward = max(available_before - gross_requirement, 0.0)
+
+                results.append({
+                    "line_no": line_no,
+                    "schedule_id": schedule["schedule_id"],
+                    "customer_name": schedule["customer_name"],
+                    "part_name": part,
+                    "due_datetime": schedule["due_datetime"],
+                    "priority": schedule["priority"],
+                    "customer_demand": demand,
+                    "minimum_stock_level": minimum_stock,
+                    "gross_requirement": gross_requirement,
+                    "current_stock_opening": current_stock if line_no == 1 else 0.0,
+                    "opening_wip_stock": opening_wip if line_no == 1 else 0.0,
+                    "dispatched_good_opening": dispatched if line_no == 1 else 0.0,
+                    "previous_schedule_carry_forward_wip": available_before if line_no > 1 else 0.0,
+                    "total_available_before_line": available_before,
+                    "wip_used_for_line": wip_used,
+                    "plan_qty": plan_qty,
+                    "carry_forward_wip_after_line": carry_forward,
+                    "calculation_rule": (
+                        "FIRST: Demand + Min Stock - Opening Available"
+                        if line_no == 1 else
+                        "NEXT: Demand + Min Stock - Previous Carry-Forward WIP"
+                    ),
+                })
+        return results
+
+    def process_schedule_wip_rows(self):
+        output = []
+        schedule_rows = self.schedule_line_calculation_rows()
+        by_part = defaultdict(list)
+        for row in schedule_rows:
+            by_part[row["part_name"]].append(row)
+
+        for part, schedules in by_part.items():
+            bom = self.conn.execute(
+                """SELECT * FROM process_bom WHERE part_name=?
+                   ORDER BY process_sequence""", (part,)
+            ).fetchall()
+            pools = {
+                int(op["process_sequence"]): self.downstream_available_qty(
+                    part, int(op["process_sequence"])
+                ) for op in bom
+            }
+            for schedule in schedules:
+                line_required = float(schedule["plan_qty"] or 0)
+                for op in bom:
+                    seq = int(op["process_sequence"])
+                    available = pools.get(seq, 0.0)
+                    wip_used = min(available, line_required)
+                    net_process_plan = max(line_required - wip_used, 0.0)
+                    pools[seq] = max(available - line_required, 0.0)
+                    output.append({
+                        "line_no": schedule["line_no"],
+                        "schedule_id": schedule["schedule_id"],
+                        "customer_name": schedule["customer_name"],
+                        "part_name": part,
+                        "due_datetime": schedule["due_datetime"],
+                        "process_sequence": seq,
+                        "operation_name": op["operation_name"],
+                        "schedule_plan_qty": line_required,
+                        "process_wip_available_before": available,
+                        "process_wip_used": wip_used,
+                        "net_process_plan_qty": net_process_plan,
+                        "process_wip_carry_forward": pools[seq],
+                    })
+        return output
+
+    def generate_plan(self):
+        schedule_rows = self.schedule_line_calculation_rows()
+        process_map = {
+            (row["schedule_id"], int(row["process_sequence"])): row
+            for row in self.process_schedule_wip_rows()
         }
-        weekly_offs = {
-            r["day_number"] - 1
-            for r in self.conn.execute("SELECT * FROM weekly_offs WHERE is_off = 1")
-        }
-        downtime_map = defaultdict(list)
-        for r in self.conn.execute("SELECT * FROM machine_downtime"):
-            downtime_map[r["machine_name"]].append(
-                (datetime.fromisoformat(r["start_datetime"]),
-                 datetime.fromisoformat(r["end_datetime"]))
-            )
-
-        reserved = defaultdict(set)
-
-        def in_interval(current, start, end):
-            if start < end:
-                return start <= current < end
-            return current >= start or current < end
-
-        def get_shift(dt):
-            current = dt.time()
-            for shift_name, start, end in shifts:
-                if in_interval(current, start, end):
-                    return shift_name
-            return ""
-
-        def is_working_minute(dt):
-            if dt.date() in holidays or dt.weekday() in weekly_offs:
-                return False
-            shift_name = get_shift(dt)
-            if not shift_name:
-                return False
-            return not any(
-                in_interval(dt.time(), start, end)
-                for start, end in break_map.get(shift_name, [])
-            )
-
-        def is_downtime(machine_name, dt):
-            return any(
-                start <= dt < end
-                for start, end in downtime_map.get(machine_name, [])
-            )
-
-        def find_slot(machine_name, end_dt, required_minutes):
-            cursor = end_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)
-            limit = end_dt - timedelta(days=MAX_LOOKBACK_DAYS)
-            minutes = []
-            while cursor >= limit and len(minutes) < required_minutes:
-                if (
-                    is_working_minute(cursor)
-                    and not is_downtime(machine_name, cursor)
-                    and cursor not in reserved[machine_name]
-                ):
-                    minutes.append(cursor)
-                cursor -= timedelta(minutes=1)
-            if len(minutes) < required_minutes:
-                return None
-            return min(minutes), max(minutes) + timedelta(minutes=1), minutes
-
         with self.conn:
             self.conn.execute("DELETE FROM production_plan")
-
-            for schedule in schedules:
-                part_name = schedule["part_name"]
-                stock = self.conn.execute(
-                    "SELECT * FROM stock_demand WHERE part_name = ?",
-                    (part_name,)
-                ).fetchone()
+            for schedule in schedule_rows:
+                if float(schedule["plan_qty"] or 0) <= 0:
+                    continue
+                part = schedule["part_name"]
                 batch = self.conn.execute(
-                    "SELECT * FROM batch_config WHERE part_name = ?",
-                    (part_name,)
+                    "SELECT * FROM batch_config WHERE part_name=?", (part,)
                 ).fetchone()
-                current_stock = stock["current_stock"] if stock else 0
-                minimum_stock = stock["minimum_stock"] if stock else 0
-                production_batch = batch["production_batch"] if batch else 0
-                transportation_batch = batch["transportation_batch"] if batch else 0
-
-                original_net_requirement = max(
-                    0,
-                    schedule["customer_qty"] + minimum_stock - current_stock
-                )
-                if original_net_requirement <= 0:
-                    continue
-
-                if production_batch <= 0:
-                    production_batch = original_net_requirement
+                transportation_batch = float(batch["transportation_batch"] or 0) if batch else 0.0
                 if transportation_batch <= 0:
-                    transportation_batch = production_batch
-
-                completed_qty = self.completed_good_qty(
-                    schedule["schedule_id"], part_name
-                )
-
-                # Revised quantity is always the exact remaining balance.
-                # Do not round the remaining requirement back up to a full
-                # production batch after operator progress has been reported.
-                remaining = max(
-                    original_net_requirement - completed_qty,
-                    0
-                )
-                if remaining <= 0:
-                    continue
-                lot_number = 1
-                due_dt = datetime.fromisoformat(schedule["due_datetime"])
-
-                operations = self.conn.execute(
-                    """SELECT * FROM process_bom
-                       WHERE part_name = ?
-                       ORDER BY process_sequence DESC""",
-                    (part_name,)
+                    transportation_batch = float(schedule["plan_qty"])
+                bom = self.conn.execute(
+                    """SELECT * FROM process_bom WHERE part_name=?
+                       ORDER BY process_sequence""", (part,)
                 ).fetchall()
-
-                while remaining > 0.000001:
-                    lot_qty = min(transportation_batch, remaining)
-                    operation_end = due_dt
-
-                    for operation in operations:
-                        process_qty = (
-                            lot_qty
-                            * max(operation["qty_multiplier"], 1)
-                            * (1 + operation["scrap_allowance"] / 100)
-                        )
-
-                        if operation["process_type"] == "OUTSOURCE":
-                            operation_start = operation_end - timedelta(
-                                hours=operation["outsource_lead_hours"]
-                            )
-                            selected_end = operation_end
-                            machine_name = "OUTSOURCE-" + operation["operation_name"]
-                            shift_name = "OUTSOURCE"
-                            note = "Outsource calendar-hour lead time"
-                        else:
-                            required_minutes = max(
-                                1,
-                                math.ceil(
-                                    process_qty * operation["cycle_time_sec"] / 60
-                                    + operation["setup_time_min"]
-                                )
-                            )
-                            machines = self.conn.execute(
-                                """SELECT machine_name, preference_order
-                                   FROM machine_recommendations
-                                   WHERE part_name = ? AND operation_name = ?
-                                   ORDER BY preference_order""",
-                                (part_name, operation["operation_name"])
-                            ).fetchall()
-
-                            best = None
-                            for machine in machines:
-                                result = find_slot(
-                                    machine["machine_name"],
-                                    operation_end,
-                                    required_minutes
-                                )
-                                if result:
-                                    start_dt, end_dt, minute_list = result
-                                    candidate = (
-                                        start_dt, end_dt, minute_list,
-                                        machine["machine_name"],
-                                        machine["preference_order"]
-                                    )
-                                    if (
-                                        best is None
-                                        or candidate[0] > best[0]
-                                        or (
-                                            candidate[0] == best[0]
-                                            and candidate[4] < best[4]
-                                        )
-                                    ):
-                                        best = candidate
-
-                            if best is None:
-                                self.conn.execute(
-                                    """INSERT INTO production_plan
-                                    (plan_id, schedule_id, customer_name,
-                                     operation_name, part_name, planned_qty,
-                                     process_sequence, process_type,
-                                     due_datetime, note)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                    (
-                                        "EXCEPTION",
-                                        schedule["schedule_id"],
-                                        schedule["customer_name"],
-                                        operation["operation_name"],
-                                        part_name,
-                                        lot_qty,
-                                        operation["process_sequence"],
-                                        operation["process_type"],
-                                        due_dt.isoformat(sep=" "),
-                                        "No feasible machine slot."
-                                    )
-                                )
-                                break
-
-                            operation_start, selected_end, minute_list, machine_name, _ = best
-                            reserved[machine_name].update(minute_list)
-                            shift_name = get_shift(operation_start)
-                            note = "Backward scheduled"
-
-                        plan_id = (
-                            f"{schedule['schedule_id']}-"
-                            f"L{lot_number:03d}-"
-                            f"S{operation['process_sequence']:03d}"
+                for op in bom:
+                    seq = int(op["process_sequence"])
+                    process_row = process_map.get((schedule["schedule_id"], seq))
+                    process_required = float(process_row["net_process_plan_qty"] or 0) if process_row else float(schedule["plan_qty"])
+                    if process_required <= 0:
+                        continue
+                    machine_row = self.conn.execute(
+                        """SELECT machine_name FROM machine_recommendations
+                           WHERE part_name=? AND operation_name=?
+                           ORDER BY preference_order LIMIT 1""",
+                        (part, op["operation_name"])
+                    ).fetchone()
+                    machine = machine_row["machine_name"] if machine_row else ""
+                    remaining = process_required
+                    lot_no = 1
+                    while remaining > 1e-9:
+                        lot_qty = min(transportation_batch, remaining)
+                        plan_id=f"{schedule['schedule_id']}-S{seq:03d}-L{lot_no:03d}"
+                        process_wip_used=float(process_row["process_wip_used"] or 0) if process_row else 0.0
+                        note=(
+                            f"Gross {schedule['gross_requirement']:g}; "
+                            f"schedule WIP used {schedule['wip_used_for_line']:g}; "
+                            f"process WIP used {process_wip_used:g}; transportation-batch split"
                         )
                         self.conn.execute(
                             """INSERT INTO production_plan
-                            (plan_id, schedule_id, customer_name, shift_name,
-                             machine_name, operation_name, part_name,
-                             planned_qty, start_datetime, end_datetime,
-                             process_sequence, process_type, due_datetime, note)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                plan_id,
-                                schedule["schedule_id"],
-                                schedule["customer_name"],
-                                shift_name,
-                                machine_name,
-                                operation["operation_name"],
-                                part_name,
-                                lot_qty,
-                                operation_start.isoformat(sep=" "),
-                                selected_end.isoformat(sep=" "),
-                                operation["process_sequence"],
-                                operation["process_type"],
-                                due_dt.isoformat(sep=" "),
-                                note,
-                            )
+                            (plan_id, requirement_type, schedule_id, customer_name,
+                             part_name, process_sequence, operation_name,
+                             machine_name, planned_qty, lot_no, due_datetime, note)
+                            VALUES (?, 'CUSTOMER_AND_MIN_STOCK', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (plan_id, schedule["schedule_id"], schedule["customer_name"],
+                             part, seq, op["operation_name"], machine, lot_qty,
+                             lot_no, schedule["due_datetime"], note)
                         )
-                        operation_end = operation_start
-
-                    remaining -= lot_qty
-                    lot_number += 1
-
-        return self.conn.execute(
-            "SELECT COUNT(*) FROM production_plan WHERE plan_id <> 'EXCEPTION'"
-        ).fetchone()[0]
+                        remaining -= lot_qty
+                        lot_no += 1
+        return self.conn.execute("SELECT COUNT(*) FROM production_plan").fetchone()[0]
 
     def plan_rows(self):
         return self.conn.execute(
             """SELECT * FROM production_plan
-               ORDER BY COALESCE(start_datetime, '9999-12-31'), process_sequence"""
+               ORDER BY COALESCE(due_datetime,'9999-12-31'),
+                        part_name, process_sequence, lot_no"""
         ).fetchall()
 
-    @staticmethod
-    def _db_datetime(value):
-        """Return a datetime for SQLite/Excel values, or None for blank/invalid values."""
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, date):
-            return datetime.combine(value, time())
-        if isinstance(value, (int, float)):
-            # Excel serial date/time, supported defensively for imported legacy data.
-            try:
-                return datetime(1899, 12, 30) + timedelta(days=float(value))
-            except (TypeError, ValueError, OverflowError):
-                return None
-        text = str(value).strip()
-        if not text:
-            return None
-        normalized = text.replace("T", " ").replace("Z", "")
-        try:
-            return datetime.fromisoformat(normalized)
-        except ValueError:
-            for fmt in (
-                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-                "%d-%b-%Y %H:%M", "%d/%m/%Y %H:%M",
-                "%d-%m-%Y %H:%M",
-            ):
-                try:
-                    return datetime.strptime(text, fmt)
-                except ValueError:
-                    continue
-        return None
 
-    def todays_slips(self, selected_date):
-        selected_date = parse_date(selected_date)
-        rows = []
-        for row in self.conn.execute(
-            """SELECT p.*, COALESCE(s.priority, 999) AS priority,
-                      COALESCE(u.actual_qty, 0) AS actual_qty,
-                      COALESCE(u.rejected_qty, 0) AS rejected_qty,
-                      COALESCE(u.good_qty, 0) AS good_qty,
-                      COALESCE(u.status, 'Not Started') AS status,
-                      COALESCE(u.operator_name, '') AS operator_name,
-                      COALESCE(u.supervisor_name, '') AS supervisor_name,
-                      COALESCE(u.remarks, '') AS remarks
-               FROM production_plan p
-               LEFT JOIN customer_schedules s
-                 ON p.schedule_id = s.schedule_id
-               LEFT JOIN production_updates u
-                 ON p.plan_id = u.plan_id
-               WHERE p.process_type = 'INHOUSE'
-                 AND p.start_datetime IS NOT NULL
-                 AND TRIM(p.start_datetime) <> ''
-                 AND p.end_datetime IS NOT NULL
-                 AND TRIM(p.end_datetime) <> ''
-               ORDER BY p.machine_name, p.shift_name, p.start_datetime"""
-        ):
-            start = self._db_datetime(row["start_datetime"])
-            end = self._db_datetime(row["end_datetime"])
-            if start is None or end is None:
-                continue
-            if start.date() <= selected_date <= end.date():
-                rows.append(row)
-        return rows
+    def process_wip_report_rows(self):
+        results = []
+        summaries = {
+            (r["part_name"], int(r["process_sequence"])): r
+            for r in self.wip_rows()
+        }
+        for bom in self.conn.execute(
+            """SELECT part_name, process_sequence, operation_name
+               FROM process_bom
+               ORDER BY part_name, process_sequence"""
+        ).fetchall():
+            part = bom["part_name"]
+            seq = int(bom["process_sequence"])
+            summary = summaries.get((part, seq), {})
+            wip_qty = float(summary.get("wip_after_process", 0) or 0)
 
-    def create_machine_slip_pdf(self, selected_date, output_path):
-        selected_date = parse_date(selected_date)
-        rows = self.todays_slips(selected_date)
-        if not rows:
-            raise ValueError(
-                f"No in-house machine operations found for {selected_date.isoformat()}."
+            oldest = self.conn.execute(
+                """SELECT * FROM operator_entries
+                   WHERE part_name=? AND process_sequence=?
+                   ORDER BY entry_date, entry_id LIMIT 1""",
+                (part, seq)
+            ).fetchone()
+            latest = self.conn.execute(
+                """SELECT * FROM operator_entries
+                   WHERE part_name=? AND process_sequence=?
+                   ORDER BY entry_date DESC, entry_id DESC LIMIT 1""",
+                (part, seq)
+            ).fetchone()
+
+            oldest_date = oldest["entry_date"] if oldest else None
+            age_days = (
+                max((date.today() - parse_date(oldest_date)).days, 0)
+                if oldest_date and wip_qty > 0 else 0
+            )
+            age_status = (
+                "No WIP" if wip_qty <= 0 else
+                "Fresh" if age_days <= 2 else
+                "Monitor" if age_days <= 7 else
+                "Old WIP"
             )
 
-        page_size = landscape(A6)
-        doc = SimpleDocTemplate(
-            output_path,
-            pagesize=page_size,
-            rightMargin=4 * mm,
-            leftMargin=4 * mm,
-            topMargin=3 * mm,
-            bottomMargin=3 * mm,
-        )
+            customer = latest["customer_name"] if latest and latest["customer_name"] else ""
+            if not customer:
+                cust = self.conn.execute(
+                    """SELECT customer_name FROM customer_schedules
+                       WHERE part_name=?
+                       ORDER BY due_datetime, priority LIMIT 1""",
+                    (part,)
+                ).fetchone()
+                customer = cust["customer_name"] if cust else ""
 
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            "SlipTitle",
-            parent=styles["Heading1"],
-            fontName="Helvetica-Bold",
-            fontSize=11.5,
-            leading=12.5,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#FFFFFF"),
-            spaceAfter=0,
-        )
-        subtitle_style = ParagraphStyle(
-            "SlipSubtitle",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=6.8,
-            leading=7.5,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#1F4E78"),
-        )
-        label_style = ParagraphStyle(
-            "SlipLabel",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=6.5,
-            leading=7.2,
-            textColor=colors.HexColor("#1F1F1F"),
-        )
-        value_style = ParagraphStyle(
-            "SlipValue",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=6.5,
-            leading=7.2,
-            textColor=colors.HexColor("#000000"),
-        )
-        machine_style = ParagraphStyle(
-            "MachineName",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=13,
-            leading=14,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#C00000"),
-        )
+            results.append({
+                "customer_name": customer,
+                "part_name": part,
+                "process_sequence": seq,
+                "operation_name": bom["operation_name"],
+                "reported_good_qty": float(summary.get("reported_cumulative_good_qty", 0) or 0),
+                "normalized_good_qty": float(summary.get("normalized_cumulative_good_qty", 0) or 0),
+                "wip_qty": wip_qty,
+                "machine_name": latest["machine_name"] if latest else "",
+                "operator_name": latest["operator_name"] if latest else "",
+                "oldest_entry_date": oldest_date,
+                "last_updated_date": latest["entry_date"] if latest else None,
+                "wip_age_days": age_days,
+                "age_status": age_status,
+                "is_dispatch_sequence": bool(summary.get("is_dispatch_sequence", False)),
+            })
+        return results
 
-        story = []
-        for index, row in enumerate(rows, start=1):
-            start_dt = datetime.fromisoformat(row["start_datetime"])
-            end_dt = datetime.fromisoformat(row["end_datetime"])
-            slip_no = f"SLIP-{selected_date:%Y%m%d}-{index:03d}"
-
-            header = Table(
-                [[Paragraph("ELECTRO-DIP", title_style)]],
-                colWidths=[140 * mm],
-                rowHeights=[8 * mm],
-            )
-            header.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#1F4E78")),
-                ("BOX", (0, 0), (-1, -1), 1.2, colors.HexColor("#1F4E78")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]))
-            story.append(header)
-
-            sub_header = Table(
-                [[Paragraph("MACHINE PRODUCTION SLIP", subtitle_style),
-                  Paragraph(f"Slip No: {slip_no}", subtitle_style)]],
-                colWidths=[78 * mm, 62 * mm],
-            )
-            sub_header.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#D9EAF7")),
-                ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#5B9BD5")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B7B7B7")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 1),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-            ]))
-            story.append(sub_header)
-            story.append(Spacer(1, 1 * mm))
-
-            machine_box = Table(
-                [[Paragraph(str(row["machine_name"]), machine_style)]],
-                colWidths=[140 * mm],
-                rowHeights=[9 * mm],
-            )
-            machine_box.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF2CC")),
-                ("BOX", (0, 0), (-1, -1), 1.2, colors.HexColor("#BF9000")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]))
-            story.append(machine_box)
-            story.append(Spacer(1, 1 * mm))
-
-            detail_data = [
-                [
-                    Paragraph("Date", label_style),
-                    Paragraph(selected_date.strftime("%d-%b-%Y"), value_style),
-                    Paragraph("Shift", label_style),
-                    Paragraph(str(row["shift_name"]), value_style),
-                ],
-                [
-                    Paragraph("Part", label_style),
-                    Paragraph(str(row["part_name"]), value_style),
-                    Paragraph("Planned Qty", label_style),
-                    Paragraph(f"{row['planned_qty']:g}", value_style),
-                ],
-                [
-                    Paragraph("Operation", label_style),
-                    Paragraph(str(row["operation_name"]), value_style),
-                    Paragraph("Sequence", label_style),
-                    Paragraph(str(row["process_sequence"]), value_style),
-                ],
-                [
-                    Paragraph("Start", label_style),
-                    Paragraph(start_dt.strftime("%d-%b %H:%M"), value_style),
-                    Paragraph("End", label_style),
-                    Paragraph(end_dt.strftime("%d-%b %H:%M"), value_style),
-                ],
-                [
-                    Paragraph("Schedule ID", label_style),
-                    Paragraph(str(row["schedule_id"]), value_style),
-                    Paragraph("Priority", label_style),
-                    Paragraph(
-                        str(self.conn.execute(
-                            "SELECT priority FROM customer_schedules WHERE schedule_id = ? LIMIT 1",
-                            (row["schedule_id"],)
-                        ).fetchone()[0]),
-                        value_style
-                    ),
-                ],
-            ]
-            details = Table(
-                detail_data,
-                colWidths=[19 * mm, 51 * mm, 21 * mm, 49 * mm],
-                rowHeights=[5.5 * mm] * len(detail_data),
-            )
-            details.setStyle(TableStyle([
-                ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#7F7F7F")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#B7B7B7")),
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E2F0D9")),
-                ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#E2F0D9")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 1),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-            ]))
-            story.append(details)
-            story.append(Spacer(1, 1 * mm))
-
-            supervisor_data = [
-                [
-                    Paragraph("Supervisor Instruction", label_style),
-                    Paragraph("_____________________________________________", value_style),
-                ],
-                [
-                    Paragraph("Actual Qty", label_style),
-                    Paragraph("______________", value_style),
-                ],
-                [
-                    Paragraph("Status", label_style),
-                    Paragraph("Not Started / Running / Completed / Hold", value_style),
-                ],
-                [
-                    Paragraph("Operator Sign", label_style),
-                    Paragraph("____________________", value_style),
-                ],
-            ]
-            supervisor = Table(
-                supervisor_data,
-                colWidths=[32 * mm, 108 * mm],
-                rowHeights=[5.5 * mm, 5.5 * mm, 5.5 * mm, 5.5 * mm],
-            )
-            supervisor.setStyle(TableStyle([
-                ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#7F7F7F")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#B7B7B7")),
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FCE4D6")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-            ]))
-            story.append(supervisor)
-
-
-            if index < len(rows):
-                story.append(PageBreak())
-
-        doc.build(story)
-        return len(rows)
-
-    def export_plan(self, output_path):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Production_Plan"
-        headers = [
-            "Plan ID", "Schedule ID", "Customer Name", "Shift Name",
-            "Machine Name", "Operation Name", "Part Name", "Planned Qty",
-            "Production Start", "Production End", "Process Sequence",
-            "Process Type", "Due Date/Time", "Status / Note"
-        ]
-        ws.append(headers)
-        for row in self.plan_rows():
-            ws.append([
-                row["plan_id"], row["schedule_id"], row["customer_name"],
-                row["shift_name"], row["machine_name"],
-                row["operation_name"], row["part_name"],
-                row["planned_qty"], row["start_datetime"], row["end_datetime"],
-                row["process_sequence"], row["process_type"],
-                row["due_datetime"], row["note"]
-            ])
-
-        slip_ws = wb.create_sheet("Machine_Slips")
-        slip_ws.append([
-            "Machine", "Shift", "Customer", "Operation", "Part",
-            "Plan Qty", "Actual Qty", "Rejected Qty", "Start", "End",
-            "Schedule ID", "Priority", "Status", "Remarks"
-        ])
-        today = date.today()
-        for row in self.todays_slips(today):
-            slip_ws.append([
-                row["machine_name"], row["shift_name"], row["customer_name"],
-                row["operation_name"], row["part_name"], row["planned_qty"],
-                "", "", row["start_datetime"], row["end_datetime"],
-                row["schedule_id"], row["priority"], "", ""
-            ])
-
-        for sheet in wb.worksheets:
-            for cell in sheet[1]:
-                cell.fill = PatternFill("solid", fgColor="5B9BD5")
-                cell.font = Font(color="FFFFFF", bold=True)
-                cell.alignment = Alignment(horizontal="center")
-            for column in range(1, sheet.max_column + 1):
-                max_length = max(
-                    len(str(sheet.cell(row, column).value or ""))
-                    for row in range(1, sheet.max_row + 1)
-                )
-                sheet.column_dimensions[get_column_letter(column)].width = min(
-                    max(max_length + 2, 12), 35
-                )
-        wb.save(output_path)
-
-
-def fit_text(canvas_obj, text, max_width, font_name="Helvetica-Bold",
-             max_size=11, min_size=6):
-    text = str(text or "")
-    size = max_size
-    while size > min_size and stringWidth(text, font_name, size) > max_width:
-        size -= 0.5
-    canvas_obj.setFont(font_name, size)
-    return size
-
-
-def draw_field(c, x, y, width, height, label, value,
-               label_fill=colors.HexColor("#D9EAF7"),
-               value_fill=colors.white,
-               border=colors.HexColor("#7F8C8D"),
-               value_font="Helvetica-Bold"):
-    c.setStrokeColor(border)
-    c.setLineWidth(0.55)
-    c.setFillColor(label_fill)
-    c.rect(x, y, width * 0.35, height, stroke=1, fill=1)
-    c.setFillColor(value_fill)
-    c.rect(x + width * 0.35, y, width * 0.65, height, stroke=1, fill=1)
-
-    c.setFillColor(colors.HexColor("#1F1F1F"))
-    c.setFont("Helvetica-Bold", 6.5)
-    c.drawString(x + 2.2 * mm, y + height / 2 - 2.1, str(label))
-
-    value_text = str(value or "")
-    fit_text(c, value_text, width * 0.62 - 4 * mm,
-             font_name=value_font, max_size=8.5, min_size=5.5)
-    c.drawString(x + width * 0.35 + 2.2 * mm,
-                 y + height / 2 - 2.4, value_text)
-
-
-def draw_checkbox(c, x, y, label, checked=False):
-    box = 4 * mm
-    c.setStrokeColor(colors.HexColor("#34495E"))
-    c.setFillColor(colors.white)
-    c.rect(x, y, box, box, stroke=1, fill=1)
-    if checked:
-        c.setStrokeColor(colors.HexColor("#1E8449"))
-        c.setLineWidth(1.3)
-        c.line(x + 0.8 * mm, y + 2 * mm, x + 1.8 * mm, y + 0.8 * mm)
-        c.line(x + 1.8 * mm, y + 0.8 * mm, x + 3.4 * mm, y + 3.3 * mm)
-    c.setFillColor(colors.HexColor("#2C3E50"))
-    c.setFont("Helvetica", 6.5)
-    c.drawString(x + box + 1.4 * mm, y + 1.1 * mm, label)
-
-
-def create_machine_slips_pdf(rows, selected_date, output_path):
-    """
-    Print only the approved ELECTRO-DIP grouped machine slip format.
-
-    Grouping:
-      selected date + machine + shift = one A4 landscape page.
-    """
-    from collections import defaultdict
-
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[(row["machine_name"], row["shift_name"])].append(row)
-
-    page_width, page_height = landscape((297 * mm, 210 * mm))
-    c = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
-    c.setTitle(f"ELECTRO-DIP Machine Slips {selected_date.isoformat()}")
-
-    logo_path = Path(__file__).resolve().parent / "electro_dip_logo.png"
-
-    def cell(x, y, w, h, text="", fill=colors.white,
-             font="Helvetica", size=6.4, align="center",
-             text_color=colors.HexColor("#1F1F1F"),
-             border=colors.HexColor("#7F8C8D")):
-        c.setStrokeColor(border)
-        c.setLineWidth(0.45)
-        c.setFillColor(fill)
-        c.rect(x, y, w, h, stroke=1, fill=1)
-
-        c.setFillColor(text_color)
-        fit_text(c, text, w - 3 * mm, font_name=font,
-                 max_size=size, min_size=4.2)
-        baseline = y + h / 2 - 2.0
-        if align == "left":
-            c.drawString(x + 1.5 * mm, baseline, str(text or ""))
-        elif align == "right":
-            c.drawRightString(x + w - 1.5 * mm, baseline, str(text or ""))
-        else:
-            c.drawCentredString(x + w / 2, baseline, str(text or ""))
-
-    def field(x, y, w, h, label, value, label_fill):
-        label_w = w * 0.36
-        cell(x, y, label_w, h, label, label_fill,
-             font="Helvetica-Bold", size=6.2, align="left")
-        cell(x + label_w, y, w - label_w, h, value, colors.white,
-             font="Helvetica-Bold", size=8.2, align="left")
-
-    for slip_no, ((machine_name, shift_name), operations) in enumerate(
-        sorted(grouped.items()), start=1
-    ):
-        operations.sort(key=lambda row: row["start_datetime"])
-
-        # Page background and border.
-        c.setFillColor(colors.HexColor("#F7F9FB"))
-        c.rect(0, 0, page_width, page_height, stroke=0, fill=1)
-        c.setStrokeColor(colors.HexColor("#1F4E78"))
-        c.setLineWidth(1.2)
-        c.roundRect(5 * mm, 5 * mm, page_width - 10 * mm,
-                    page_height - 10 * mm, 3 * mm, stroke=1, fill=0)
-
-        # Blue header exactly as approved.
-        header_y = page_height - 30 * mm
-        c.setFillColor(colors.HexColor("#1F4E78"))
-        c.roundRect(5 * mm, header_y, page_width - 10 * mm,
-                    25 * mm, 3 * mm, stroke=0, fill=1)
-
-        if logo_path.exists():
-            c.setFillColor(colors.white)
-            c.rect(9 * mm, header_y + 4 * mm, 18 * mm, 17 * mm,
-                   stroke=0, fill=1)
-            c.drawImage(str(logo_path), 10 * mm, header_y + 5 * mm,
-                        width=16 * mm, height=15 * mm,
-                        preserveAspectRatio=True, mask="auto")
-
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(34 * mm, header_y + 15 * mm, "ELECTRO-DIP")
-        c.setFont("Helvetica-Bold", 8.5)
-        c.drawString(34 * mm, header_y + 8 * mm,
-                     "MACHINE DAILY PRODUCTION SLIP")
-
-        c.setFont("Helvetica-Bold", 7)
-        c.drawRightString(
-            page_width - 10 * mm, header_y + 16 * mm,
-            f"Slip No.: MS-{selected_date:%Y%m%d}-{slip_no:03d}"
-        )
-        c.drawRightString(
-            page_width - 10 * mm, header_y + 10 * mm,
-            f"Date: {selected_date:%d-%b-%Y}"
-        )
-
-        # Header fields: Customer intentionally excluded.
-        info_y = header_y - 12 * mm
-        field(8 * mm, info_y, 92 * mm, 9 * mm,
-              "Machine", machine_name, colors.HexColor("#D9EAF7"))
-        field(103 * mm, info_y, 53 * mm, 9 * mm,
-              "Shift", shift_name, colors.HexColor("#E4DFEC"))
-        field(159 * mm, info_y, 62 * mm, 9 * mm,
-              "Operator", "", colors.HexColor("#E2F0D9"))
-        field(224 * mm, info_y, 65 * mm, 9 * mm,
-              "Supervisor", "", colors.HexColor("#FFF2CC"))
-
-        # Operations table.
-        table_top = info_y - 6 * mm
-        table_x = 8 * mm
-        row_h = 8.4 * mm
-        widths_mm = [8, 16, 16, 30, 24, 42, 18, 20, 22, 18, 18, 36]
-        widths = [value * mm for value in widths_mm]
-        headings = [
-            "Sr", "Start", "End", "Customer", "Part No.",
-            "Operation", "Plan Qty", "Actual Qty", "Rejected Qty",
-            "Priority", "Status", "Remarks"
+    def machine_wip_rows(self):
+        grouped = defaultdict(float)
+        for row in self.process_wip_report_rows():
+            if row["wip_qty"] > 0:
+                grouped[(row["machine_name"] or "UNASSIGNED", row["operation_name"])] += row["wip_qty"]
+        return [
+            {"machine_name": k[0], "operation_name": k[1], "wip_qty": v}
+            for k, v in sorted(grouped.items())
         ]
 
-        header_row_y = table_top - row_h
-        current_x = table_x
-        for heading, width in zip(headings, widths):
-            cell(current_x, header_row_y, width, row_h, heading,
-                 colors.HexColor("#1F4E78"),
-                 font="Helvetica-Bold", size=6.2,
-                 text_color=colors.white)
-            current_x += width
+    def part_wip_rows(self):
+        grouped = defaultdict(float)
+        for row in self.process_wip_report_rows():
+            grouped[row["part_name"]] += row["wip_qty"]
+        return [{"part_name": k, "total_wip_qty": v} for k, v in sorted(grouped.items())]
 
-        # Same page supports 12 lines, like a practical daily slip.
-        max_rows = 12
-        shown_operations = operations[:max_rows]
-        total_planned = 0.0
-        total_actual = 0.0
-        total_rejected = 0.0
+    def customer_wip_rows(self):
+        grouped = defaultdict(float)
+        for row in self.process_wip_report_rows():
+            grouped[row["customer_name"] or "UNALLOCATED"] += row["wip_qty"]
+        return [{"customer_name": k, "total_wip_qty": v} for k, v in sorted(grouped.items())]
 
-        for index, row in enumerate(shown_operations, start=1):
-            y = header_row_y - index * row_h
-            alternate = (
-                colors.white if index % 2
-                else colors.HexColor("#F2F5F7")
-            )
-            start_dt = datetime.fromisoformat(row["start_datetime"])
-            end_dt = datetime.fromisoformat(row["end_datetime"])
+    def dispatch_history_rows(self):
+        return [
+            dict(row) for row in self.conn.execute(
+                """SELECT e.* FROM operator_entries e
+                   WHERE e.process_sequence=(
+                       SELECT MAX(p.process_sequence)
+                       FROM process_bom p WHERE p.part_name=e.part_name
+                   )
+                   ORDER BY e.entry_date DESC, e.entry_id DESC"""
+            ).fetchall()
+        ]
 
-            values = [
-                index,
-                start_dt.strftime("%H:%M"),
-                end_dt.strftime("%H:%M"),
-                row["customer_name"],
-                row["part_name"],
-                row["operation_name"],
-                f"{float(row['planned_qty'] or 0):g}",
-                f"{float(row['actual_qty'] or 0):g}" if float(row['actual_qty'] or 0) else "",
-                f"{float(row['rejected_qty'] or 0):g}" if float(row['rejected_qty'] or 0) else "",
-                str(row["priority"] if "priority" in row.keys() else ""),
-                str(row["status"] or ""),
-                str(row["remarks"] or ""),
-            ]
-            total_planned += float(row["planned_qty"] or 0)
-            total_actual += float(row["actual_qty"] or 0)
-            total_rejected += float(row["rejected_qty"] or 0)
+    def export_wip_excel(self, output_path):
+        wb = xlsxwriter.Workbook(output_path)
+        title = wb.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E78", "font_size": 14, "align": "center"})
+        header = wb.add_format({"bold": True, "font_color": "white", "bg_color": "#5B9BD5", "border": 1, "align": "center", "text_wrap": True})
+        cell = wb.add_format({"border": 1})
+        qty = wb.add_format({"border": 1, "num_format": "0.00"})
+        note = wb.add_format({"border": 1, "text_wrap": True})
 
-            current_x = table_x
-            for col_index, (value, width) in enumerate(zip(values, widths)):
-                fill = alternate
-                if col_index == 7:
-                    fill = colors.HexColor("#E2F0D9")
-                elif col_index == 8:
-                    fill = colors.HexColor("#FCE4D6")
-                elif col_index == 9:
-                    fill = colors.HexColor("#FFF2CC")
+        def write_sheet(name, records, sheet_title):
+            ws = wb.add_worksheet(name[:31])
+            if not records:
+                ws.write(0, 0, sheet_title, title)
+                ws.write(2, 0, "No data")
+                return
+            columns=list(records[0].keys())
+            ws.merge_range(0,0,0,len(columns)-1,sheet_title,title)
+            for c,col in enumerate(columns):
+                ws.write(1,c,col,header)
+            for r,record in enumerate(records,start=2):
+                for c,col in enumerate(columns):
+                    value=record.get(col)
+                    fmt=qty if isinstance(value,float) else note if col in ("calculation_rule","note","remarks") else cell
+                    ws.write(r,c,value,fmt)
+            ws.autofilter(1,0,len(records)+1,len(columns)-1)
+            ws.freeze_panes(2,0)
+            for c,col in enumerate(columns):
+                width=34 if col in ("calculation_rule","operation_name","remarks","note") else max(14,min(38,len(col)+5))
+                ws.set_column(c,c,width)
 
-                align = "left" if col_index in (3, 5, 11) else "center"
-                font = (
-                    "Helvetica-Bold"
-                    if col_index in (3, 4, 5, 6)
-                    else "Helvetica"
-                )
-                cell(current_x, y, width, row_h, value, fill,
-                     font=font, size=6.2, align=align)
-                current_x += width
-
-        # Totals row.
-        totals_y = header_row_y - (max(len(shown_operations), 1) + 1) * row_h - 4 * mm
-        field(8 * mm, totals_y, 66 * mm, 9 * mm,
-              "Total Planned Qty", f"{total_planned:g}",
-              colors.HexColor("#D9EAF7"))
-        field(77 * mm, totals_y, 66 * mm, 9 * mm,
-              "Total Actual Qty", f"{total_actual:g}" if total_actual else "",
-              colors.HexColor("#E2F0D9"))
-        field(146 * mm, totals_y, 66 * mm, 9 * mm,
-              "Total Rejected Qty", f"{total_rejected:g}" if total_rejected else "",
-              colors.HexColor("#F4CCCC"))
-        field(215 * mm, totals_y, 74 * mm, 9 * mm,
-              "Machine Utilization", "____ %",
-              colors.HexColor("#FFF2CC"))
-
-        # Remarks and overall status.
-        remarks_y = totals_y - 18 * mm
-        remarks_w = 195 * mm
-        cell(8 * mm, remarks_y, remarks_w, 15 * mm, "",
-             colors.white, align="left")
-        c.setFillColor(colors.HexColor("#1F4E78"))
-        c.setFont("Helvetica-Bold", 6.4)
-        c.drawString(10 * mm, remarks_y + 11 * mm,
-                     "SUPERVISOR / QUALITY REMARKS")
-        c.setStrokeColor(colors.HexColor("#BDC3C7"))
-        c.line(10 * mm, remarks_y + 7 * mm,
-               8 * mm + remarks_w - 3 * mm, remarks_y + 7 * mm)
-        c.line(10 * mm, remarks_y + 3.5 * mm,
-               8 * mm + remarks_w - 3 * mm, remarks_y + 3.5 * mm)
-
-        status_x = 206 * mm
-        status_w = 83 * mm
-        cell(status_x, remarks_y, status_w, 15 * mm, "",
-             colors.white)
-        c.setFillColor(colors.HexColor("#2C3E50"))
-        c.setFont("Helvetica", 6.2)
-        c.drawString(status_x + 3 * mm, remarks_y + 10.5 * mm,
-                     "Status:")
-        c.drawString(status_x + 20 * mm, remarks_y + 10.5 * mm,
-                     "[ ] Completed")
-        c.drawString(status_x + 55 * mm, remarks_y + 10.5 * mm,
-                     "[ ] Hold")
-        c.drawString(status_x + 20 * mm, remarks_y + 4.5 * mm,
-                     "[ ] Running")
-        c.drawString(status_x + 55 * mm, remarks_y + 4.5 * mm,
-                     "[ ] Rework")
-
-        # Signatures at bottom.
-        signature_y = 9 * mm
-        c.setFillColor(colors.HexColor("#2C3E50"))
-        c.setFont("Helvetica", 6.4)
-        c.drawString(
-            10 * mm, signature_y,
-            "Operator Sign: ______________________________"
-        )
-        c.drawCentredString(
-            page_width / 2, signature_y,
-            "Quality Sign: ______________________________"
-        )
-        c.drawRightString(
-            page_width - 10 * mm, signature_y,
-            "Supervisor Sign: ______________________________"
-        )
-
-        if len(operations) > max_rows:
-            c.setFillColor(colors.HexColor("#C0392B"))
-            c.setFont("Helvetica-Bold", 6)
-            c.drawRightString(
-                page_width - 10 * mm, remarks_y - 4 * mm,
-                f"Additional operations: {len(operations) - max_rows}"
-            )
-
-        c.showPage()
-
-    c.save()
-    return output_path
+        write_sheet("Schedule_Line_Calculation", self.schedule_line_calculation_rows(), "SCHEDULE-LINE PLAN QUANTITY CALCULATION")
+        write_sheet("Process_WIP_Allocation", self.process_schedule_wip_rows(), "PROCESS-BOM-WISE WIP ALLOCATION")
+        write_sheet("WIP_Summary", self.wip_rows(), "CURRENT PHYSICAL WIP SUMMARY")
+        write_sheet("Process_WIP_Report", self.process_wip_report_rows(), "PROCESS-WISE WIP REPORT WITH AGEING")
+        write_sheet("Machine_WIP", self.machine_wip_rows(), "MACHINE-WISE WIP")
+        write_sheet("Part_WIP", self.part_wip_rows(), "PART-WISE WIP")
+        write_sheet("Customer_WIP", self.customer_wip_rows(), "CUSTOMER-WISE WIP")
+        write_sheet("Dispatch_History", self.dispatch_history_rows(), "DISPATCH HISTORY")
+        write_sheet("Production_Plan", [dict(r) for r in self.plan_rows()], "TRANSPORTATION-BATCH PRODUCTION PLAN")
+        write_sheet("Operator_Entries", [dict(r) for r in self.operator_entries()], "PERSISTENT OPERATOR ENTRIES")
+        logic=wb.add_worksheet("Logic")
+        logic.set_column("A:A",30); logic.set_column("B:B",95)
+        logic.write("A1","Rule",header); logic.write("B1","Application",header)
+        rules=[
+            ("First schedule line","Plan Qty = Demand + Minimum Stock Level - Opening Available Stock/WIP."),
+            ("Further schedule lines","Plan Qty = Demand + Minimum Stock Level - Previous Schedule Carry-Forward WIP."),
+            ("Process WIP","Each Process BOM sequence has its own WIP pool. WIP is consumed FIFO and cannot be reused."),
+            ("Dispatch","Highest Process BOM sequence is Dispatch. Only dispatch good quantity closes customer demand."),
+            ("Transportation batch","Net process plan is split into transportation batches. The final lot may be smaller."),
+            ("Persistence","Operator entries remain saved until Clear Previous Entries is used."),
+        ]
+        for r,row in enumerate(rules,start=1): logic.write_row(r,0,row,cell)
+        wb.close()
 

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+electro_dip_persistent.db
+*.db-wal
+*.db-shm
