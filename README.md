@@ -103,3 +103,48 @@ Every subsequent operation row displays its own Plan ID.
 Machine, Shift, Production Date, Production Start Time,
 Production End Time and Planned Qty are automatically populated
 from the selected Plan ID and are read-only.
+
+
+## Version 15 — Attractive Header Grid
+
+The app now includes:
+- Branded ELECTRO-DIP header with logo
+- Production Planning & WIP Control title
+- Header summary cards for schedules, plan rows, saved entries and WIP
+- Styled navigation grid with highlighted active tab
+- Responsive layout for desktop, tablet and mobile
+- Improved metric and report-table styling
+
+
+## Version 16 — Transportation Lot Planning
+
+The V14 schedule quantity logic remains unchanged.
+
+Transportation batch is used only to split the exact process quantity.
+
+Example:
+- Schedule Plan Qty: 240
+- Transportation Batch: 100
+- Production Lots: 100 + 100 + 40
+- Total remains 240
+
+Production Plan includes:
+- Schedule Plan Qty V14
+- Net Process Plan Qty
+- Transportation Batch Qty
+- Lot No.
+- Lot Planned Qty
+
+
+## Version 17 — Operation Sequence Gate
+
+The app now prevents process jumping and over-processing.
+
+Rules:
+- First process cannot exceed its transportation-lot planned quantity.
+- Every next process is limited by good quantity released by the immediate
+  previous process for the same Schedule ID and Lot No.
+- Partial entries are allowed.
+- Quantity already processed at the current operation is deducted.
+- Validation is enforced both in the screen and in the database save method.
+- Dispatch is therefore limited by the good output of the previous operation.

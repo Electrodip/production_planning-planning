@@ -600,6 +600,136 @@ class Database:
         ]
         return values
 
+    def _plan_route_rows(self, schedule_id, lot_no):
+        """Return all process rows for one schedule and transportation lot."""
+        return self.conn.execute(
+            """SELECT *
+               FROM production_plan
+               WHERE schedule_id=? AND lot_no=?
+               ORDER BY process_sequence""",
+            (str(schedule_id), int(lot_no))
+        ).fetchall()
+
+    def _operator_actual_sum(self, plan_id):
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(actual_qty),0) AS qty
+               FROM operator_entries
+               WHERE plan_id=?""",
+            (str(plan_id),)
+        ).fetchone()
+        return float(row["qty"] or 0)
+
+    def _operator_good_sum(self, plan_id):
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(good_qty),0) AS qty
+               FROM operator_entries
+               WHERE plan_id=?""",
+            (str(plan_id),)
+        ).fetchone()
+        return float(row["qty"] or 0)
+
+    def sequence_gate_status(self, plan_id):
+        """
+        Return the maximum quantity that may be entered for a Plan ID.
+
+        First process:
+            max allowed = lot planned qty - actual already entered here
+
+        Subsequent process:
+            max allowed = previous process good qty - actual already entered here
+        """
+        plan = self.plan_id_detail(plan_id)
+        if not plan:
+            raise ValueError("Selected Plan ID was not found.")
+
+        schedule_id = str(plan["schedule_id"])
+        lot_no = int(plan["lot_no"])
+        current_sequence = int(plan["process_sequence"])
+        route = self._plan_route_rows(schedule_id, lot_no)
+
+        current_index = None
+        for idx, row in enumerate(route):
+            if int(row["process_sequence"]) == current_sequence:
+                current_index = idx
+                break
+        if current_index is None:
+            raise ValueError("Current operation is not available in the plan route.")
+
+        already_processed = self._operator_actual_sum(plan_id)
+        lot_planned_qty = float(plan["planned_qty"] or 0)
+
+        if current_index == 0:
+            previous_plan_id = ""
+            previous_operation = "FIRST OPERATION"
+            previous_good_qty = lot_planned_qty
+            max_allowed = max(lot_planned_qty - already_processed, 0.0)
+            gate_open = max_allowed > 0
+            reason = (
+                "First operation is limited by the lot planned quantity."
+                if gate_open else
+                "The full planned quantity has already been entered for this operation."
+            )
+        else:
+            previous = route[current_index - 1]
+            previous_plan_id = str(previous["plan_id"])
+            previous_operation = str(previous["operation_name"])
+            previous_good_qty = self._operator_good_sum(previous_plan_id)
+            max_allowed = max(previous_good_qty - already_processed, 0.0)
+            gate_open = max_allowed > 0
+
+            if previous_good_qty <= 0:
+                reason = (
+                    f"Operation jumping is blocked. No good quantity is available "
+                    f"from previous operation: {previous_operation}."
+                )
+            elif max_allowed <= 0:
+                reason = (
+                    f"No balance is available from previous operation: "
+                    f"{previous_operation}."
+                )
+            else:
+                reason = (
+                    f"Maximum allowed is based on good quantity released by "
+                    f"{previous_operation}."
+                )
+
+        return {
+            "plan_id": str(plan_id),
+            "schedule_id": schedule_id,
+            "lot_no": lot_no,
+            "part_name": plan["part_name"],
+            "current_sequence": current_sequence,
+            "current_operation": plan["operation_name"],
+            "lot_planned_qty": lot_planned_qty,
+            "previous_plan_id": previous_plan_id,
+            "previous_operation": previous_operation,
+            "previous_good_qty": previous_good_qty,
+            "already_processed_here": already_processed,
+            "maximum_entry_allowed": max_allowed,
+            "gate_open": gate_open,
+            "reason": reason,
+        }
+
+    def validate_sequence_entry(self, plan_id, actual_qty):
+        status = self.sequence_gate_status(plan_id)
+        actual = max(float(actual_qty or 0), 0.0)
+
+        if actual <= 0:
+            raise ValueError("Actual Qty must be greater than zero.")
+
+        if not status["gate_open"]:
+            raise ValueError(status["reason"])
+
+        if actual > status["maximum_entry_allowed"] + 1e-9:
+            raise ValueError(
+                f"Cannot save {actual:g} pcs. Maximum allowed for this operation "
+                f"and lot is {status['maximum_entry_allowed']:g} pcs. "
+                f"Previous operation good qty: {status['previous_good_qty']:g}; "
+                f"already processed here: {status['already_processed_here']:g}."
+            )
+
+        return status
+
     def add_operator_entry(
         self, entry_date, part_name, process_sequence, operation_name,
         actual_qty, rejected_qty, machine_name="", shift_name="",
@@ -608,6 +738,15 @@ class Database:
     ):
         actual = max(float(actual_qty or 0), 0)
         rejected = max(float(rejected_qty or 0), 0)
+
+        if rejected > actual:
+            raise ValueError("Rejected Qty cannot exceed Actual Qty.")
+
+        # Sequence gate applies to production-plan entries. Opening WIP and
+        # administrative records without a Plan ID are excluded.
+        if str(plan_id or "").strip():
+            self.validate_sequence_entry(plan_id, actual)
+
         good = max(actual - rejected, 0)
         with self.conn:
             self.conn.execute(
@@ -913,6 +1052,31 @@ class Database:
                     })
         return output
 
+    @staticmethod
+    def split_transportation_lots(total_qty, transportation_batch):
+        """
+        Split the exact calculated quantity into transportation lots.
+        The total quantity is never rounded or changed.
+
+        Example:
+            240 qty, batch 100 -> [100, 100, 40]
+        """
+        total = max(float(total_qty or 0), 0.0)
+        batch = float(transportation_batch or 0)
+
+        if total <= 0:
+            return []
+        if batch <= 0:
+            return [total]
+
+        lots = []
+        remaining = total
+        while remaining > 1e-9:
+            lot_qty = min(batch, remaining)
+            lots.append(lot_qty)
+            remaining -= lot_qty
+        return lots
+
     def generate_plan(self):
         """
         Build a WIP-adjusted, transportation-batch plan and backward-schedule
@@ -1059,12 +1223,10 @@ class Database:
                         if process_row
                         else float(schedule["plan_qty"])
                     )
-                    lots = []
-                    remaining = process_required
-                    while remaining > 1e-9:
-                        lot_qty = min(transportation_batch, remaining)
-                        lots.append(lot_qty)
-                        remaining -= lot_qty
+                    lots = self.split_transportation_lots(
+                        process_required,
+                        transportation_batch,
+                    )
                     operation_lots[seq] = lots
                     max_lots = max(max_lots, len(lots))
 
@@ -1311,21 +1473,55 @@ class Database:
 
 
     def production_plan_report_rows(self):
-        """Production plan rows enriched for screen, Excel and operator slips."""
-        return [
-            dict(row)
-            for row in self.conn.execute(
-                """SELECT p.*,
-                          COALESCE(s.priority, 999) AS priority,
-                          COALESCE(s.customer_qty, 0) AS customer_demand
-                   FROM production_plan p
-                   LEFT JOIN customer_schedules s
-                     ON p.schedule_id=s.schedule_id
-                   ORDER BY COALESCE(p.due_datetime,'9999-12-31'),
-                            p.machine_name, p.part_name,
-                            p.process_sequence, p.lot_no"""
-            ).fetchall()
-        ]
+        """
+        Production plan rows with V14 schedule qty and transportation-lot details.
+        """
+        schedule_qty = {
+            row["schedule_id"]: float(row["plan_qty"] or 0)
+            for row in self.schedule_line_calculation_rows()
+        }
+        process_qty = {
+            (row["schedule_id"], int(row["process_sequence"])): float(
+                row["net_process_plan_qty"] or 0
+            )
+            for row in self.process_schedule_wip_rows()
+        }
+
+        rows = self.conn.execute(
+            """SELECT p.*,
+                      COALESCE(s.priority, 999) AS priority,
+                      COALESCE(s.customer_qty, 0) AS customer_demand,
+                      COALESCE(b.transportation_batch, 0) AS transportation_batch
+               FROM production_plan p
+               LEFT JOIN customer_schedules s
+                 ON p.schedule_id=s.schedule_id
+               LEFT JOIN batch_config b
+                 ON p.part_name=b.part_name
+               ORDER BY COALESCE(
+                            p.production_start_datetime,
+                            p.due_datetime,
+                            '9999-12-31'
+                        ),
+                        p.machine_name, p.part_name,
+                        p.process_sequence, p.lot_no"""
+        ).fetchall()
+
+        output = []
+        for row in rows:
+            record = dict(row)
+            schedule_id = record["schedule_id"]
+            sequence = int(record["process_sequence"])
+            record["schedule_plan_qty_v14"] = schedule_qty.get(schedule_id, 0.0)
+            record["net_process_plan_qty"] = process_qty.get(
+                (schedule_id, sequence),
+                record["schedule_plan_qty_v14"],
+            )
+            record["transportation_batch_qty"] = float(
+                record.pop("transportation_batch", 0) or 0
+            )
+            record["lot_planned_qty"] = float(record.get("planned_qty") or 0)
+            output.append(record)
+        return output
 
     def export_production_plan_excel(self, output_path):
         wb = xlsxwriter.Workbook(output_path)
@@ -1351,9 +1547,11 @@ class Database:
         columns = [
             "plan_id", "requirement_type", "schedule_id", "customer_name",
             "part_name", "process_sequence", "operation_name", "machine_name",
-            "planned_qty", "lot_no", "due_datetime",
+            "schedule_plan_qty_v14", "net_process_plan_qty",
+            "transportation_batch_qty", "lot_no", "lot_planned_qty",
             "production_start_datetime", "production_end_datetime",
-            "shift_name", "priority", "customer_demand", "note"
+            "shift_name", "due_datetime", "priority",
+            "customer_demand", "note"
         ]
 
         ws.merge_range(0, 0, 0, len(columns)-1,
@@ -1371,8 +1569,12 @@ class Database:
         widths = {
             "plan_id": 28, "requirement_type": 22, "schedule_id": 18,
             "customer_name": 22, "part_name": 18, "process_sequence": 16,
-            "operation_name": 28, "machine_name": 20, "planned_qty": 15,
-            "lot_no": 10, "due_datetime": 22,
+            "operation_name": 28, "machine_name": 20,
+            "schedule_plan_qty_v14": 20,
+            "net_process_plan_qty": 20,
+            "transportation_batch_qty": 22,
+            "lot_no": 10, "lot_planned_qty": 17,
+            "due_datetime": 22,
             "production_start_datetime": 22,
             "production_end_datetime": 22,
             "shift_name": 14, "priority": 10,
