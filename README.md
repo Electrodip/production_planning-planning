@@ -164,3 +164,30 @@ Schedule calculation:
 - Process WIP is considered only after schedule quantity calculation
 - Transportation batch splits the exact process quantity
 - All later features remain included
+
+
+## Version 22 — Edit and Delete Previous Entries
+
+Previous Entries tab now includes:
+- Entry date, part and Plan ID filters
+- Entry ID selection
+- Edit Actual Qty
+- Edit Rejected Qty
+- Edit Operator
+- Edit Supervisor
+- Edit Status
+- Edit Remarks
+- Save Changes
+- Delete Entry with confirmation
+
+Plan-controlled fields cannot be edited:
+- Plan ID
+- Part
+- Operation
+- Machine
+- Shift
+- Planned Qty
+- Production date
+
+WIP, ageing and operation-sequence gates recalculate automatically after
+editing or deleting an operator entry.

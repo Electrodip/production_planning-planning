@@ -770,6 +770,105 @@ class Database:
             )
         return good
 
+    def operator_entry_by_id(self, entry_id):
+        row = self.conn.execute(
+            "SELECT * FROM operator_entries WHERE entry_id=?",
+            (int(entry_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_operator_entry(
+        self,
+        entry_id,
+        actual_qty,
+        rejected_qty,
+        status="",
+        operator_name="",
+        supervisor_name="",
+        remarks="",
+    ):
+        """
+        Edit an existing operator entry.
+
+        Plan-controlled fields remain unchanged:
+        Plan ID, part, process, machine, shift, planned qty and entry date.
+        """
+        existing = self.operator_entry_by_id(entry_id)
+        if not existing:
+            raise ValueError("Operator entry was not found.")
+
+        actual = max(float(actual_qty or 0), 0.0)
+        rejected = max(float(rejected_qty or 0), 0.0)
+
+        if actual <= 0:
+            raise ValueError("Actual Qty must be greater than zero.")
+        if rejected > actual:
+            raise ValueError("Rejected Qty cannot exceed Actual Qty.")
+
+        # Recalculate sequence gate while excluding the current entry,
+        # otherwise the existing quantity would be counted twice.
+        plan_id = str(existing.get("plan_id") or "")
+        if plan_id:
+            original_actual = float(existing.get("actual_qty") or 0)
+            gate = self.sequence_gate_status(plan_id)
+            maximum_if_editing = (
+                float(gate["maximum_entry_allowed"]) + original_actual
+            )
+            if actual > maximum_if_editing + 1e-9:
+                raise ValueError(
+                    f"Cannot save {actual:g} pcs. Maximum allowed after "
+                    f"considering the previous operation is "
+                    f"{maximum_if_editing:g} pcs."
+                )
+
+        good = max(actual - rejected, 0.0)
+
+        with self.conn:
+            self.conn.execute(
+                """UPDATE operator_entries
+                   SET actual_qty=?,
+                       rejected_qty=?,
+                       good_qty=?,
+                       status=?,
+                       operator_name=?,
+                       supervisor_name=?,
+                       remarks=?,
+                       created_at=?
+                   WHERE entry_id=?""",
+                (
+                    actual,
+                    rejected,
+                    good,
+                    str(status or ""),
+                    str(operator_name or ""),
+                    str(supervisor_name or ""),
+                    str(remarks or ""),
+                    datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                    int(entry_id),
+                ),
+            )
+        return good
+
+    def delete_operator_entry(self, entry_id):
+        """
+        Permanently delete one operator entry.
+
+        All WIP, ageing and sequence-gate reports recalculate automatically
+        because they are derived from operator_entries.
+        """
+        existing = self.operator_entry_by_id(entry_id)
+        if not existing:
+            raise ValueError("Operator entry was not found.")
+
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM operator_entries WHERE entry_id=?",
+                (int(entry_id),),
+            )
+        return existing
+
     def operator_entries(self):
         return self.conn.execute(
             """SELECT * FROM operator_entries

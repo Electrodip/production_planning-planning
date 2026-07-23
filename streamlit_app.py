@@ -572,12 +572,233 @@ with tabs[8]:
         st.dataframe(process_wip_df, hide_index=True, use_container_width=True, height=520)
 
 with tabs[9]:
-    st.subheader("Saved Previous Operator Entries")
-    entries_df = pd.DataFrame([dict(r) for r in db.operator_entries()])
+    st.subheader("Previous Operator Entries")
+    st.caption(
+        "Use Edit to correct Actual Qty, Rejected Qty, names, status or remarks. "
+        "Use Delete only for a completely wrong entry. WIP and sequence control "
+        "recalculate automatically."
+    )
+
+    entries = [dict(r) for r in db.operator_entries()]
+    entries_df = pd.DataFrame(entries)
+
     if entries_df.empty:
-        st.info("No saved entries.")
+        st.info("No saved operator entries.")
     else:
-        st.dataframe(entries_df, hide_index=True, use_container_width=True, height=560)
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+
+        entry_dates = ["All"] + sorted(
+            entries_df["entry_date"].dropna().astype(str).unique().tolist(),
+            reverse=True,
+        )
+        parts = ["All"] + sorted(
+            entries_df["part_name"].dropna().astype(str).unique().tolist()
+        )
+        plan_ids = ["All"] + sorted(
+            [
+                value for value in
+                entries_df["plan_id"].dropna().astype(str).unique().tolist()
+                if value
+            ]
+        )
+
+        selected_date = filter_col1.selectbox(
+            "Entry Date",
+            entry_dates,
+            key="previous_entry_date_filter",
+        )
+        selected_part = filter_col2.selectbox(
+            "Part Number",
+            parts,
+            key="previous_entry_part_filter",
+        )
+        selected_plan = filter_col3.selectbox(
+            "Plan ID",
+            plan_ids,
+            key="previous_entry_plan_filter",
+        )
+
+        filtered_entries = entries_df.copy()
+        if selected_date != "All":
+            filtered_entries = filtered_entries[
+                filtered_entries["entry_date"].astype(str) == selected_date
+            ]
+        if selected_part != "All":
+            filtered_entries = filtered_entries[
+                filtered_entries["part_name"].astype(str) == selected_part
+            ]
+        if selected_plan != "All":
+            filtered_entries = filtered_entries[
+                filtered_entries["plan_id"].astype(str) == selected_plan
+            ]
+
+        display_columns = [
+            "entry_id", "entry_date", "plan_id", "schedule_id",
+            "customer_name", "part_name", "process_sequence",
+            "operation_name", "machine_name", "shift_name",
+            "planned_qty", "actual_qty", "rejected_qty", "good_qty",
+            "operator_name", "supervisor_name", "status",
+            "remarks", "created_at",
+        ]
+        visible_columns = [
+            column for column in display_columns
+            if column in filtered_entries.columns
+        ]
+
+        st.dataframe(
+            filtered_entries[visible_columns],
+            hide_index=True,
+            use_container_width=True,
+            height=430,
+        )
+
+        st.markdown("### Edit or Delete Entry")
+        available_ids = filtered_entries["entry_id"].astype(int).tolist()
+
+        if not available_ids:
+            st.info("No entries match the selected filters.")
+        else:
+            selected_entry_id = st.selectbox(
+                "Select Entry ID",
+                available_ids,
+                key="selected_previous_entry_id",
+            )
+
+            selected_entry = db.operator_entry_by_id(selected_entry_id)
+
+            if selected_entry:
+                st.info(
+                    f"Plan ID: {selected_entry.get('plan_id') or '-'} | "
+                    f"Part: {selected_entry['part_name']} | "
+                    f"Operation: {selected_entry['process_sequence']} - "
+                    f"{selected_entry['operation_name']} | "
+                    f"Machine: {selected_entry.get('machine_name') or '-'}"
+                )
+
+                edit_col1, edit_col2 = st.columns(2)
+
+                edit_actual = edit_col1.number_input(
+                    "Actual Qty",
+                    min_value=0.0,
+                    value=float(selected_entry["actual_qty"] or 0),
+                    step=1.0,
+                    key=f"edit_actual_{selected_entry_id}",
+                )
+                edit_rejected = edit_col2.number_input(
+                    "Rejected Qty",
+                    min_value=0.0,
+                    value=float(selected_entry["rejected_qty"] or 0),
+                    step=1.0,
+                    key=f"edit_rejected_{selected_entry_id}",
+                )
+
+                operator_names = db.personnel_names("OPERATOR")
+                supervisor_names = db.personnel_names("SUPERVISOR")
+
+                current_operator = str(
+                    selected_entry.get("operator_name") or ""
+                )
+                current_supervisor = str(
+                    selected_entry.get("supervisor_name") or ""
+                )
+
+                if current_operator and current_operator not in operator_names:
+                    operator_names = [current_operator] + operator_names
+                if current_supervisor and current_supervisor not in supervisor_names:
+                    supervisor_names = [current_supervisor] + supervisor_names
+
+                name_col1, name_col2 = st.columns(2)
+                edit_operator = name_col1.selectbox(
+                    "Operator Name",
+                    operator_names if operator_names else [""],
+                    index=(
+                        operator_names.index(current_operator)
+                        if current_operator in operator_names else 0
+                    ),
+                    key=f"edit_operator_{selected_entry_id}",
+                )
+                edit_supervisor = name_col2.selectbox(
+                    "Supervisor Name",
+                    supervisor_names if supervisor_names else [""],
+                    index=(
+                        supervisor_names.index(current_supervisor)
+                        if current_supervisor in supervisor_names else 0
+                    ),
+                    key=f"edit_supervisor_{selected_entry_id}",
+                )
+
+                status_options = [
+                    "Running", "Completed", "Hold", "Rework"
+                ]
+                current_status = str(selected_entry.get("status") or "")
+                if current_status and current_status not in status_options:
+                    status_options = [current_status] + status_options
+
+                edit_status = st.selectbox(
+                    "Status",
+                    status_options,
+                    index=(
+                        status_options.index(current_status)
+                        if current_status in status_options else 0
+                    ),
+                    key=f"edit_status_{selected_entry_id}",
+                )
+
+                edit_remarks = st.text_area(
+                    "Remarks",
+                    value=str(selected_entry.get("remarks") or ""),
+                    key=f"edit_remarks_{selected_entry_id}",
+                )
+
+                action_col1, action_col2 = st.columns(2)
+
+                with action_col1:
+                    if st.button(
+                        "Save Changes",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            good_qty = db.update_operator_entry(
+                                entry_id=selected_entry_id,
+                                actual_qty=edit_actual,
+                                rejected_qty=edit_rejected,
+                                status=edit_status,
+                                operator_name=edit_operator,
+                                supervisor_name=edit_supervisor,
+                                remarks=edit_remarks,
+                            )
+                            st.success(
+                                f"Entry {selected_entry_id} updated. "
+                                f"Good Qty = {good_qty:g}. "
+                                "WIP recalculated automatically."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+                with action_col2:
+                    delete_confirm = st.checkbox(
+                        "Confirm permanent deletion",
+                        key=f"delete_confirm_{selected_entry_id}",
+                    )
+                    if st.button(
+                        "Delete Entry",
+                        type="secondary",
+                        disabled=not delete_confirm,
+                        use_container_width=True,
+                    ):
+                        try:
+                            deleted = db.delete_operator_entry(
+                                selected_entry_id
+                            )
+                            st.success(
+                                f"Entry {selected_entry_id} deleted. "
+                                "WIP and sequence controls recalculated."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
 
 with tabs[10]:
     st.subheader("Download Complete WIP Workbook")
