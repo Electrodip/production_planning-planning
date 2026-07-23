@@ -186,7 +186,7 @@ with tabs[2]:
         slip_df = pd.DataFrame(slip_rows)
         if not slip_df.empty:
             preferred = [
-                "machine_name", "customer_name", "part_name",
+                "plan_id", "machine_name", "customer_name", "part_name",
                 "process_sequence", "operation_name", "planned_qty",
                 "production_start_datetime", "production_end_datetime",
                 "shift_name", "lot_no", "schedule_id",
@@ -218,56 +218,164 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Daily Operator Entry")
-    bom_df = pd.DataFrame([dict(r) for r in db.bom_rows()])
-    if bom_df.empty:
-        st.warning("Import Process BOM first.")
+
+    plan_rows = db.plan_id_rows()
+    if not plan_rows:
+        st.warning("Generate the production plan first.")
     else:
-        parts = sorted(bom_df["part_name"].astype(str).unique())
-        part = st.selectbox("Part Number", parts)
-        part_ops = bom_df[bom_df["part_name"].astype(str) == str(part)]
-        sequence = st.selectbox(
+        plan_ids = [row["plan_id"] for row in plan_rows]
+
+        top1, top2 = st.columns([2, 1])
+        selected_plan_id = top1.selectbox(
+            "Plan ID",
+            plan_ids,
+            key="operator_plan_id",
+        )
+        plan_detail = db.plan_id_detail(selected_plan_id)
+
+        with top2:
+            st.caption("Selected plan")
+            st.write(
+                f"{plan_detail['part_name']} | "
+                f"{plan_detail['operation_name']} | "
+                f"{plan_detail['planned_qty']:g}"
+            )
+
+        part = str(plan_detail["part_name"])
+        sequence = int(plan_detail["process_sequence"])
+        operation = str(plan_detail["operation_name"])
+        customer_name = str(plan_detail.get("customer_name") or "")
+        schedule_id = str(plan_detail.get("schedule_id") or "")
+        planned_default = float(plan_detail.get("planned_qty") or 0)
+
+        production_start = plan_detail.get("production_start_datetime")
+        production_date = (
+            pd.to_datetime(production_start).date()
+            if production_start else date.today()
+        )
+
+        machine_values = db.machine_dropdown_values()
+        selected_machine_default = str(plan_detail.get("machine_name") or "")
+        if selected_machine_default and selected_machine_default not in machine_values:
+            machine_values = [selected_machine_default] + machine_values
+
+        shift_values = db.shift_dropdown_values()
+        selected_shift_default = str(plan_detail.get("shift_name") or "")
+        if selected_shift_default and selected_shift_default not in shift_values:
+            shift_values = [selected_shift_default] + shift_values
+
+        c1, c2 = st.columns(2)
+        c1.text_input("Part Number", value=part, disabled=True)
+        c2.text_input(
             "Process / Sequence",
-            part_ops["process_sequence"].tolist(),
-            format_func=lambda seq: (
-                f"{int(seq)} - "
-                f"{part_ops[part_ops['process_sequence']==seq]['operation_name'].iloc[0]}"
+            value=f"{sequence} - {operation}",
+            disabled=True,
+        )
+
+        c3, c4, c5 = st.columns(3)
+        entry_date = c3.date_input(
+            "Entry Date",
+            value=production_date,
+            key=f"entry_date_{selected_plan_id}",
+        )
+        machine = c4.selectbox(
+            "Machine",
+            machine_values if machine_values else [""],
+            index=(
+                machine_values.index(selected_machine_default)
+                if selected_machine_default in machine_values else 0
             ),
+            key=f"machine_{selected_plan_id}",
         )
-        operation = part_ops[
-            part_ops["process_sequence"] == sequence
-        ]["operation_name"].iloc[0]
+        shift = c5.selectbox(
+            "Shift",
+            shift_values if shift_values else [""],
+            index=(
+                shift_values.index(selected_shift_default)
+                if selected_shift_default in shift_values else 0
+            ),
+            key=f"shift_{selected_plan_id}",
+        )
 
-        c1, c2, c3 = st.columns(3)
-        entry_date = c1.date_input("Entry Date", value=date.today())
-        machine = c2.text_input("Machine")
-        shift = c3.text_input("Shift")
+        c6, c7, c8 = st.columns(3)
+        actual = c6.number_input(
+            "Actual Qty",
+            min_value=0.0,
+            step=1.0,
+            key=f"actual_{selected_plan_id}",
+        )
+        rejected = c7.number_input(
+            "Rejected Qty",
+            min_value=0.0,
+            step=1.0,
+            key=f"rejected_{selected_plan_id}",
+        )
+        planned = c8.number_input(
+            "Planned Qty",
+            min_value=0.0,
+            value=planned_default,
+            step=1.0,
+            key=f"planned_{selected_plan_id}",
+        )
 
-        c4, c5, c6 = st.columns(3)
-        actual = c4.number_input("Actual Qty", min_value=0.0, step=1.0)
-        rejected = c5.number_input("Rejected Qty", min_value=0.0, step=1.0)
-        planned = c6.number_input("Planned Qty", min_value=0.0, step=1.0)
+        operator_names = db.personnel_names("OPERATOR")
+        supervisor_names = db.personnel_names("SUPERVISOR")
 
-        c7, c8 = st.columns(2)
-        operator = c7.text_input("Operator Name")
-        supervisor = c8.text_input("Supervisor Name")
+        p1, p2 = st.columns(2)
+        operator = p1.selectbox(
+            "Operator Name",
+            operator_names if operator_names else [""],
+            key=f"operator_{selected_plan_id}",
+        )
+        supervisor = p2.selectbox(
+            "Supervisor Name",
+            supervisor_names if supervisor_names else [""],
+            key=f"supervisor_{selected_plan_id}",
+        )
+
+        with st.expander("Add Operator / Supervisor Name"):
+            a1, a2, a3 = st.columns([2, 1, 1])
+            new_person_name = a1.text_input("Name")
+            new_person_role = a2.selectbox(
+                "Role", ["OPERATOR", "SUPERVISOR"]
+            )
+            if a3.button("Add Name"):
+                try:
+                    db.add_personnel(new_person_name, new_person_role)
+                    st.success("Name added. Refresh this tab to see it in the dropdown.")
+                except Exception as exc:
+                    st.error(str(exc))
+
         status = st.selectbox(
-            "Status", ["", "Running", "Completed", "Hold", "Rework"]
+            "Status",
+            ["Running", "Completed", "Hold", "Rework"],
+            key=f"status_{selected_plan_id}",
         )
-        remarks = st.text_area("Remarks")
+        remarks = st.text_area(
+            "Remarks",
+            key=f"remarks_{selected_plan_id}",
+        )
 
         if st.button("Save Operator Entry", type="primary"):
             if rejected > actual:
                 st.error("Rejected Qty cannot exceed Actual Qty.")
+            elif not operator:
+                st.error("Select an Operator Name.")
+            elif not supervisor:
+                st.error("Select a Supervisor Name.")
             else:
                 good = db.add_operator_entry(
                     entry_date=entry_date,
                     part_name=part,
-                    process_sequence=int(sequence),
+                    process_sequence=sequence,
                     operation_name=operation,
                     actual_qty=actual,
                     rejected_qty=rejected,
                     machine_name=machine,
                     shift_name=shift,
+                    plan_id=selected_plan_id,
+                    schedule_id=schedule_id,
+                    customer_name=customer_name,
                     planned_qty=planned,
                     status=status,
                     operator_name=operator,
@@ -275,10 +383,31 @@ with tabs[3]:
                     remarks=remarks,
                 )
                 st.success(
-                    f"Entry saved. Good Qty = {good:g}. "
-                    "This entry will remain until Clear Previous Entries is used."
+                    f"Entry saved for Plan ID {selected_plan_id}. "
+                    f"Good Qty = {good:g}."
                 )
 
+        today_entries = pd.DataFrame([
+            dict(r) for r in db.operator_entries()
+            if str(r["entry_date"]) == entry_date.isoformat()
+        ])
+        st.markdown(f"#### Today's Entries ({entry_date:%d-%b-%Y})")
+        if today_entries.empty:
+            st.info("No entries for the selected date.")
+        else:
+            preferred = [
+                "plan_id", "part_name", "process_sequence",
+                "operation_name", "machine_name", "shift_name",
+                "planned_qty", "actual_qty", "rejected_qty",
+                "operator_name", "supervisor_name", "status",
+                "created_at",
+            ]
+            visible = [c for c in preferred if c in today_entries.columns]
+            st.dataframe(
+                today_entries[visible],
+                hide_index=True,
+                use_container_width=True,
+            )
 
 with tabs[4]:
     st.subheader("Process-wise WIP Report")

@@ -76,3 +76,23 @@ Production Plan and Operator Slips now include:
 - Machine downtime
 - Recommended-machine capacity selection
 - Outsource lead-time scheduling
+
+
+## Version 12 dropdown and Plan ID update
+
+Daily Operator Entry now includes:
+- Plan ID dropdown
+- Machine dropdown
+- Shift dropdown
+- Operator dropdown
+- Supervisor dropdown
+- Add-name personnel master
+- Automatic part/process/qty/date selection from Plan ID
+- Plan ID saved in operator history
+- Plan ID printed on operator-slip PDF
+
+
+## Version 13 — Plan ID in every slip row
+
+The operator-slip table now prints Plan ID as the first column.
+Every subsequent operation row displays its own Plan ID.

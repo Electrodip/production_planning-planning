@@ -154,8 +154,17 @@ class Database:
             is_off INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS personnel_master (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_name TEXT NOT NULL,
+            role_name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(person_name, role_name)
+        );
+
         CREATE TABLE IF NOT EXISTS operator_entries (
             entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id TEXT DEFAULT '',
             entry_date TEXT NOT NULL,
             schedule_id TEXT DEFAULT '',
             customer_name TEXT DEFAULT '',
@@ -210,6 +219,16 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE production_plan "
                 "ADD COLUMN production_end_datetime TEXT"
+            )
+
+        operator_columns = {
+            row[1] for row in self.conn.execute(
+                "PRAGMA table_info(operator_entries)"
+            ).fetchall()
+        }
+        if "plan_id" not in operator_columns:
+            self.conn.execute(
+                "ALTER TABLE operator_entries ADD COLUMN plan_id TEXT DEFAULT ''"
             )
         self.conn.commit()
 
@@ -515,10 +534,76 @@ class Database:
             ).fetchone()[0],
         }
 
+    def personnel_names(self, role_name):
+        return [
+            row["person_name"]
+            for row in self.conn.execute(
+                """SELECT person_name
+                   FROM personnel_master
+                   WHERE role_name=? AND active=1
+                   ORDER BY person_name""",
+                (str(role_name).strip().upper(),)
+            ).fetchall()
+        ]
+
+    def add_personnel(self, person_name, role_name):
+        name = str(person_name or "").strip()
+        role = str(role_name or "").strip().upper()
+        if not name:
+            raise ValueError("Person name is required.")
+        if role not in ("OPERATOR", "SUPERVISOR"):
+            raise ValueError("Role must be OPERATOR or SUPERVISOR.")
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO personnel_master
+                (person_name, role_name, active)
+                VALUES (?, ?, 1)""",
+                (name, role)
+            )
+
+    def plan_id_rows(self):
+        return self.production_plan_report_rows()
+
+    def plan_id_detail(self, plan_id):
+        row = self.conn.execute(
+            """SELECT p.*,
+                      COALESCE(s.priority, 999) AS priority,
+                      COALESCE(s.customer_qty, 0) AS customer_demand
+               FROM production_plan p
+               LEFT JOIN customer_schedules s
+                 ON p.schedule_id=s.schedule_id
+               WHERE p.plan_id=?""",
+            (str(plan_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def machine_dropdown_values(self):
+        values = set()
+        for row in self.conn.execute(
+            "SELECT DISTINCT machine_name FROM machine_recommendations"
+        ).fetchall():
+            if row["machine_name"]:
+                values.add(row["machine_name"])
+        for row in self.conn.execute(
+            "SELECT DISTINCT machine_name FROM production_plan"
+        ).fetchall():
+            if row["machine_name"]:
+                values.add(row["machine_name"])
+        return sorted(values)
+
+    def shift_dropdown_values(self):
+        values = [
+            row["shift_name"]
+            for row in self.conn.execute(
+                "SELECT shift_name FROM shifts WHERE active=1 ORDER BY shift_name"
+            ).fetchall()
+        ]
+        return values
+
     def add_operator_entry(
         self, entry_date, part_name, process_sequence, operation_name,
         actual_qty, rejected_qty, machine_name="", shift_name="",
-        schedule_id="", customer_name="", planned_qty=0, status="",
+        plan_id="", schedule_id="", customer_name="", planned_qty=0, status="",
         operator_name="", supervisor_name="", remarks=""
     ):
         actual = max(float(actual_qty or 0), 0)
@@ -527,12 +612,13 @@ class Database:
         with self.conn:
             self.conn.execute(
                 """INSERT INTO operator_entries
-                (entry_date, schedule_id, customer_name, part_name,
+                (plan_id, entry_date, schedule_id, customer_name, part_name,
                  process_sequence, operation_name, machine_name, shift_name,
                  planned_qty, actual_qty, rejected_qty, good_qty, status,
                  operator_name, supervisor_name, remarks, source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?)""",
                 (
+                    str(plan_id or ""),
                     parse_date(entry_date).isoformat(), str(schedule_id or ""),
                     str(customer_name or ""), str(part_name).strip(),
                     int(process_sequence), str(operation_name).strip(),
@@ -1415,6 +1501,18 @@ class Database:
                 page_w-10*mm, page_h-21*mm,
                 f"Date: {slip_date:%d-%b-%Y}"
             )
+            plan_ids = sorted({
+                str(row.get("plan_id") or "")
+                for row in group_rows
+                if row.get("plan_id")
+            })
+            plan_id_text = ", ".join(plan_ids[:3])
+            if len(plan_ids) > 3:
+                plan_id_text += f" +{len(plan_ids)-3} more"
+            c.drawRightString(
+                page_w-10*mm, page_h-27*mm,
+                f"Plan ID: {plan_id_text}"
+            )
 
             def box(x, y, w, h, label, value, label_fill):
                 label_w = w * 0.36
@@ -1437,11 +1535,11 @@ class Database:
             box(224*mm, info_y, 65*mm, 9*mm, "Supervisor", "", colors.HexColor("#FFF2CC"))
 
             headers = [
-                "Sr", "Start", "End", "Customer", "Part No.",
+                "Plan ID", "Sr", "Start", "End", "Customer", "Part No.",
                 "Operation", "Plan Qty", "Actual Qty", "Rejected Qty",
                 "Priority", "Status", "Remarks"
             ]
-            widths = [8, 16, 16, 30, 24, 42, 18, 20, 22, 18, 18, 36]
+            widths = [30, 7, 14, 14, 27, 21, 36, 16, 18, 20, 15, 16, 29]
             widths = [w*mm for w in widths]
             row_h = 8.2*mm
             table_x = 8*mm
@@ -1475,8 +1573,9 @@ class Database:
                     ).strftime("%H:%M")
 
                 values = [
-                    idx, start_text, end_text, row.get("customer_name", ""),
-                    row.get("part_name", ""), row.get("operation_name", ""),
+                    row.get("plan_id", ""), idx, start_text, end_text,
+                    row.get("customer_name", ""), row.get("part_name", ""),
+                    row.get("operation_name", ""),
                     float(row.get("planned_qty") or 0), "", "",
                     row.get("priority", ""), "", ""
                 ]
@@ -1485,22 +1584,25 @@ class Database:
                 x = table_x
                 for col_idx, (value, width) in enumerate(zip(values, widths)):
                     fill = colors.white if idx % 2 else colors.HexColor("#F2F5F7")
-                    if col_idx == 7:
+                    if col_idx == 8:
                         fill = colors.HexColor("#E2F0D9")
-                    elif col_idx == 8:
+                    elif col_idx == 9:
                         fill = colors.HexColor("#FCE4D6")
                     c.setFillColor(fill)
                     c.setStrokeColor(colors.HexColor("#7F8C8D"))
                     c.rect(x, y, width, row_h, stroke=1, fill=1)
                     c.setFillColor(colors.HexColor("#1F1F1F"))
                     c.setFont(
-                        "Helvetica-Bold" if col_idx in (3, 4, 5, 6) else "Helvetica",
-                        6
+                        "Helvetica-Bold"
+                        if col_idx in (0, 4, 5, 6, 7)
+                        else "Helvetica",
+                        5.8
                     )
                     text = str(value or "")
-                    if len(text) > 22:
-                        text = text[:20] + ".."
-                    if col_idx in (3, 5, 11):
+                    max_chars = 26 if col_idx == 0 else 22
+                    if len(text) > max_chars:
+                        text = text[:max_chars-2] + ".."
+                    if col_idx in (0, 4, 6, 12):
                         c.drawString(x+1.2*mm, y+2.4*mm, text)
                     else:
                         c.drawCentredString(x+width/2, y+2.4*mm, text)
