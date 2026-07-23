@@ -191,3 +191,29 @@ Plan-controlled fields cannot be edited:
 
 WIP, ageing and operation-sequence gates recalculate automatically after
 editing or deleting an operator entry.
+
+
+## Version 23 — Import Diagnostics Before Import
+
+New workflow:
+1. Upload Excel
+2. Validate Template
+3. Review worksheet health and detailed diagnostics
+4. Import only after validation passes
+
+Checks include:
+- Required sheets
+- Required column headings
+- Duplicate Schedule IDs
+- Duplicate stock/batch records
+- Mandatory blank cells
+- Invalid quantities, dates and times
+- Missing Process BOM, stock or batch master
+- Invalid process types
+- Missing cycle time or outsource lead time
+- Missing machine recommendations
+- Incomplete machine downtime
+- Invalid shift data
+
+The diagnostic report shows severity, sheet, row, column, reason and value.
+Critical errors block import. Warnings do not block import.

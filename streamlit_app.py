@@ -1,12 +1,14 @@
 
 import os
 import tempfile
+import hashlib
 import base64
-from datetime import date
+from datetime import datetime, date, time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 from planner_core import Database
 
@@ -50,6 +52,670 @@ def make_production_plan_excel_bytes():
     finally:
         path.unlink(missing_ok=True)
 
+
+REQUIRED_SHEETS = {
+    "Customer_Schedules": [
+        "Schedule ID", "Customer Name", "Part Name",
+        "Customer Required Qty", "Required Delivery Date",
+        "Required Delivery Time", "Priority",
+    ],
+    "Stock_Demand": [
+        "Part Name", "Current FG Stock", "Minimum Stock", "Remarks",
+    ],
+    "Batch_Config": [
+        "Part Name", "Production Batch Qty", "Transportation Batch Qty",
+    ],
+    "Process_BOM": [
+        "Part Name", "Process Sequence", "Operation Name", "Process Type",
+        "Cycle Time Sec/Part", "Setup Time Min",
+        "Outsource Lead Time Hours", "Qty Multiplier",
+        "Scrap Allowance %",
+    ],
+    "Machine_Recommendations": [
+        "Part Name", "Operation Name",
+    ],
+}
+
+OPTIONAL_SHEETS = {
+    "Machine_Downtime": [
+        "Machine Name", "Unavailable Start Date", "Unavailable Start Time",
+        "Unavailable End Date", "Unavailable End Time", "Reason",
+    ],
+    "Shifts": ["Shift Name", "Start Time", "End Time", "Active (Y/N)"],
+    "Breaks": [
+        "Shift Name", "Break Name", "Break Start Time", "Break End Time",
+    ],
+    "Holidays": ["Holiday Date", "Holiday Name"],
+    "Weekly_Offs": ["Day Number", "Day Name", "Is Weekly Off (Y/N)"],
+    "Opening_WIP": [
+        "Entry Date", "Part Name", "Process Sequence", "Operation Name",
+        "Actual Qty", "Rejected Qty", "Good Qty", "Machine",
+        "Operator", "Remarks",
+    ],
+}
+
+
+def _diag_value_blank(value):
+    return value is None or str(value).strip() == ""
+
+
+def _diag_number(value):
+    if _diag_value_blank(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _diag_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return (datetime(1899, 12, 30) + pd.to_timedelta(float(value), unit="D")).date()
+        except Exception:
+            return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _diag_time(value):
+    if isinstance(value, datetime):
+        return value.time()
+    if isinstance(value, time):
+        return value
+    if isinstance(value, (int, float)):
+        return True
+    text = str(value).strip()
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p"):
+        try:
+            datetime.strptime(text, fmt)
+            return True
+        except ValueError:
+            pass
+    return None
+
+
+def _add_diagnostic(items, severity, sheet, row, column, reason, value=""):
+    items.append({
+        "Severity": severity,
+        "Sheet": sheet,
+        "Row": row,
+        "Column": column,
+        "Reason": reason,
+        "Value": "" if value is None else str(value),
+    })
+
+
+def validate_import_template(file_source):
+    """
+    Validate an Electro-Dip import workbook before importing.
+
+    Returns:
+      valid_for_import: True when no ERROR diagnostics exist
+      diagnostics: sheet/row/column-level findings
+      sheet_summary: validation status and populated-row counts
+    """
+    if hasattr(file_source, "seek"):
+        file_source.seek(0)
+
+    workbook = load_workbook(
+        file_source,
+        data_only=True,
+        read_only=True,
+    )
+
+    diagnostics = []
+    sheet_summary = []
+    workbook_sheets = set(workbook.sheetnames)
+
+    # Sheet and heading validation.
+    for sheet_name, required_headers in REQUIRED_SHEETS.items():
+        if sheet_name not in workbook_sheets:
+            _add_diagnostic(
+                diagnostics, "ERROR", sheet_name, 0, "",
+                "Required worksheet is missing.",
+            )
+            sheet_summary.append({
+                "Sheet": sheet_name,
+                "Status": "Missing",
+                "Populated Rows": 0,
+            })
+            continue
+
+        ws = workbook[sheet_name]
+        headers = [
+            str(cell.value).strip() if cell.value is not None else ""
+            for cell in ws[2]
+        ]
+        missing_headers = [
+            header for header in required_headers if header not in headers
+        ]
+        for header in missing_headers:
+            _add_diagnostic(
+                diagnostics, "ERROR", sheet_name, 2, header,
+                "Required column heading is missing.",
+            )
+
+    for sheet_name, expected_headers in OPTIONAL_SHEETS.items():
+        if sheet_name not in workbook_sheets:
+            _add_diagnostic(
+                diagnostics, "WARNING", sheet_name, 0, "",
+                "Optional worksheet is missing.",
+            )
+            continue
+        ws = workbook[sheet_name]
+        headers = [
+            str(cell.value).strip() if cell.value is not None else ""
+            for cell in ws[2]
+        ]
+        for header in expected_headers:
+            if header not in headers:
+                _add_diagnostic(
+                    diagnostics, "WARNING", sheet_name, 2, header,
+                    "Expected optional column heading is missing.",
+                )
+
+    # Stop row scanning only after sheet structure checks.
+    populated_counts = {}
+
+    def rows_until_blank(ws, max_blank_run=100):
+        blank_run = 0
+        for row_number, values in enumerate(
+            ws.iter_rows(min_row=3, values_only=True), start=3
+        ):
+            if all(_diag_value_blank(value) for value in values):
+                blank_run += 1
+                if blank_run >= max_blank_run:
+                    break
+                continue
+            blank_run = 0
+            yield row_number, values
+
+    schedule_parts = set()
+    process_parts = set()
+    stock_parts = set()
+    batch_parts = set()
+    machine_routes = set()
+
+    # Customer schedules.
+    if "Customer_Schedules" in workbook_sheets:
+        ws = workbook["Customer_Schedules"]
+        seen_schedule_ids = {}
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 7
+            schedule_id, customer, part, qty, due_date, due_time, priority = values[:7]
+
+            mandatory = {
+                "Schedule ID": schedule_id,
+                "Customer Name": customer,
+                "Part Name": part,
+                "Customer Required Qty": qty,
+                "Required Delivery Date": due_date,
+                "Required Delivery Time": due_time,
+            }
+            for column, value in mandatory.items():
+                if _diag_value_blank(value):
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Customer_Schedules",
+                        row_no, column, "Mandatory value is blank.", value,
+                    )
+
+            sid = str(schedule_id).strip() if not _diag_value_blank(schedule_id) else ""
+            if sid:
+                if sid in seen_schedule_ids:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Customer_Schedules",
+                        row_no, "Schedule ID",
+                        f"Duplicate Schedule ID; first found at row {seen_schedule_ids[sid]}.",
+                        sid,
+                    )
+                else:
+                    seen_schedule_ids[sid] = row_no
+
+            if not _diag_value_blank(part):
+                schedule_parts.add(str(part).strip())
+
+            qty_num = _diag_number(qty)
+            if not _diag_value_blank(qty) and qty_num is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Customer_Schedules",
+                    row_no, "Customer Required Qty",
+                    "Quantity must be numeric.", qty,
+                )
+            elif qty_num is not None and qty_num <= 0:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Customer_Schedules",
+                    row_no, "Customer Required Qty",
+                    "Quantity must be greater than zero.", qty,
+                )
+
+            if not _diag_value_blank(due_date) and _diag_date(due_date) is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Customer_Schedules",
+                    row_no, "Required Delivery Date",
+                    "Invalid date value.", due_date,
+                )
+
+            if not _diag_value_blank(due_time) and _diag_time(due_time) is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Customer_Schedules",
+                    row_no, "Required Delivery Time",
+                    "Invalid time value.", due_time,
+                )
+
+            priority_num = _diag_number(priority)
+            if not _diag_value_blank(priority) and priority_num is None:
+                _add_diagnostic(
+                    diagnostics, "WARNING", "Customer_Schedules",
+                    row_no, "Priority",
+                    "Priority should be numeric; default priority will be used.",
+                    priority,
+                )
+
+        populated_counts["Customer_Schedules"] = count
+
+    # Stock master.
+    if "Stock_Demand" in workbook_sheets:
+        ws = workbook["Stock_Demand"]
+        seen_parts = {}
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 4
+            part, current_stock, minimum_stock, _ = values[:4]
+            if _diag_value_blank(part):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Stock_Demand", row_no,
+                    "Part Name", "Mandatory value is blank.",
+                )
+                continue
+            part_text = str(part).strip()
+            stock_parts.add(part_text)
+            if part_text in seen_parts:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Stock_Demand", row_no,
+                    "Part Name",
+                    f"Duplicate part; first found at row {seen_parts[part_text]}.",
+                    part_text,
+                )
+            else:
+                seen_parts[part_text] = row_no
+
+            for column, value in (
+                ("Current FG Stock", current_stock),
+                ("Minimum Stock", minimum_stock),
+            ):
+                number = _diag_number(value)
+                if not _diag_value_blank(value) and number is None:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Stock_Demand", row_no,
+                        column, "Value must be numeric.", value,
+                    )
+                elif number is not None and number < 0:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Stock_Demand", row_no,
+                        column, "Value cannot be negative.", value,
+                    )
+
+        populated_counts["Stock_Demand"] = count
+
+    # Batch configuration.
+    if "Batch_Config" in workbook_sheets:
+        ws = workbook["Batch_Config"]
+        seen_parts = {}
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 3
+            part, production_batch, transportation_batch = values[:3]
+            if _diag_value_blank(part):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Batch_Config", row_no,
+                    "Part Name", "Mandatory value is blank.",
+                )
+                continue
+            part_text = str(part).strip()
+            batch_parts.add(part_text)
+            if part_text in seen_parts:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Batch_Config", row_no,
+                    "Part Name",
+                    f"Duplicate part; first found at row {seen_parts[part_text]}.",
+                    part_text,
+                )
+            else:
+                seen_parts[part_text] = row_no
+
+            for column, value in (
+                ("Production Batch Qty", production_batch),
+                ("Transportation Batch Qty", transportation_batch),
+            ):
+                number = _diag_number(value)
+                if not _diag_value_blank(value) and number is None:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Batch_Config", row_no,
+                        column, "Value must be numeric.", value,
+                    )
+                elif number is not None and number < 0:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Batch_Config", row_no,
+                        column, "Value cannot be negative.", value,
+                    )
+
+            transport_num = _diag_number(transportation_batch)
+            if transport_num == 0:
+                _add_diagnostic(
+                    diagnostics, "WARNING", "Batch_Config", row_no,
+                    "Transportation Batch Qty",
+                    "Zero means the exact process quantity will remain one lot.",
+                    transportation_batch,
+                )
+
+        populated_counts["Batch_Config"] = count
+
+    # Process BOM.
+    if "Process_BOM" in workbook_sheets:
+        ws = workbook["Process_BOM"]
+        seen_routes = {}
+        sequence_by_part = {}
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 9
+            (
+                part, sequence, operation, process_type, cycle_time,
+                setup_time, outsource_hours, multiplier, scrap
+            ) = values[:9]
+
+            for column, value in (
+                ("Part Name", part),
+                ("Process Sequence", sequence),
+                ("Operation Name", operation),
+                ("Process Type", process_type),
+            ):
+                if _diag_value_blank(value):
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Process_BOM", row_no,
+                        column, "Mandatory value is blank.", value,
+                    )
+
+            if _diag_value_blank(part):
+                continue
+            part_text = str(part).strip()
+            process_parts.add(part_text)
+
+            seq_num = _diag_number(sequence)
+            if seq_num is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Process_BOM", row_no,
+                    "Process Sequence", "Sequence must be numeric.", sequence,
+                )
+                continue
+            if seq_num <= 0 or int(seq_num) != seq_num:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Process_BOM", row_no,
+                    "Process Sequence",
+                    "Sequence must be a positive whole number.", sequence,
+                )
+
+            route_key = (
+                part_text,
+                int(seq_num) if seq_num is not None else sequence,
+            )
+            if route_key in seen_routes:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Process_BOM", row_no,
+                    "Process Sequence",
+                    f"Duplicate part/sequence; first found at row {seen_routes[route_key]}.",
+                    sequence,
+                )
+            else:
+                seen_routes[route_key] = row_no
+
+            sequence_by_part.setdefault(part_text, []).append(
+                (int(seq_num), row_no)
+            )
+
+            ptype = str(process_type or "").strip().upper()
+            if ptype not in ("INHOUSE", "OUTSOURCE"):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Process_BOM", row_no,
+                    "Process Type",
+                    "Allowed values are INHOUSE or OUTSOURCE.", process_type,
+                )
+
+            if ptype == "INHOUSE":
+                cycle_num = _diag_number(cycle_time)
+                if cycle_num is None or cycle_num <= 0:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Process_BOM", row_no,
+                        "Cycle Time Sec/Part",
+                        "INHOUSE operation requires cycle time greater than zero.",
+                        cycle_time,
+                    )
+            elif ptype == "OUTSOURCE":
+                lead_num = _diag_number(outsource_hours)
+                if lead_num is None or lead_num <= 0:
+                    _add_diagnostic(
+                        diagnostics, "ERROR", "Process_BOM", row_no,
+                        "Outsource Lead Time Hours",
+                        "OUTSOURCE operation requires lead time greater than zero.",
+                        outsource_hours,
+                    )
+
+            for column, value, default, minimum in (
+                ("Setup Time Min", setup_time, 0, 0),
+                ("Qty Multiplier", multiplier, 1, 0),
+                ("Scrap Allowance %", scrap, 0, 0),
+            ):
+                if _diag_value_blank(value):
+                    _add_diagnostic(
+                        diagnostics, "WARNING", "Process_BOM", row_no,
+                        column, f"Blank value; importer will use default {default}.",
+                    )
+                else:
+                    number = _diag_number(value)
+                    if number is None or number < minimum:
+                        _add_diagnostic(
+                            diagnostics, "ERROR", "Process_BOM", row_no,
+                            column, "Invalid numeric value.", value,
+                        )
+
+        populated_counts["Process_BOM"] = count
+
+    # Machine recommendations.
+    if "Machine_Recommendations" in workbook_sheets:
+        ws = workbook["Machine_Recommendations"]
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row)
+            part = values[0] if len(values) > 0 else None
+            operation = values[1] if len(values) > 1 else None
+            machines = values[2:17]
+
+            if _diag_value_blank(part):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Machine_Recommendations", row_no,
+                    "Part Name", "Mandatory value is blank.",
+                )
+            if _diag_value_blank(operation):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Machine_Recommendations", row_no,
+                    "Operation Name", "Mandatory value is blank.",
+                )
+
+            if not _diag_value_blank(part) and not _diag_value_blank(operation):
+                machine_routes.add(
+                    (str(part).strip(), str(operation).strip())
+                )
+                if not any(not _diag_value_blank(machine) for machine in machines):
+                    _add_diagnostic(
+                        diagnostics, "WARNING", "Machine_Recommendations",
+                        row_no, "Machine 1",
+                        "No recommended machine was entered.",
+                    )
+
+        populated_counts["Machine_Recommendations"] = count
+
+    # Referential checks.
+    for part in sorted(schedule_parts):
+        if part not in process_parts:
+            _add_diagnostic(
+                diagnostics, "ERROR", "Customer_Schedules", 0, "Part Name",
+                "Scheduled part has no Process_BOM route.", part,
+            )
+        if part not in stock_parts:
+            _add_diagnostic(
+                diagnostics, "ERROR", "Customer_Schedules", 0, "Part Name",
+                "Scheduled part has no Stock_Demand record.", part,
+            )
+        if part not in batch_parts:
+            _add_diagnostic(
+                diagnostics, "ERROR", "Customer_Schedules", 0, "Part Name",
+                "Scheduled part has no Batch_Config record.", part,
+            )
+
+    # Machine route checks for in-house BOM rows.
+    if "Process_BOM" in workbook_sheets:
+        ws = workbook["Process_BOM"]
+        for row_no, row in rows_until_blank(ws):
+            values = list(row) + [None] * 4
+            part, _, operation, process_type = values[:4]
+            if (
+                not _diag_value_blank(part)
+                and not _diag_value_blank(operation)
+                and str(process_type or "").strip().upper() == "INHOUSE"
+                and (str(part).strip(), str(operation).strip()) not in machine_routes
+            ):
+                _add_diagnostic(
+                    diagnostics, "WARNING", "Process_BOM", row_no,
+                    "Operation Name",
+                    "No matching Machine_Recommendations row exists.",
+                    operation,
+                )
+
+    # Optional calendar validation.
+    if "Machine_Downtime" in workbook_sheets:
+        ws = workbook["Machine_Downtime"]
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 6
+            machine, sd, stime, ed, etime, _ = values[:6]
+            date_time_values = (sd, stime, ed, etime)
+            if _diag_value_blank(machine):
+                _add_diagnostic(
+                    diagnostics, "WARNING", "Machine_Downtime", row_no,
+                    "Machine Name", "Blank row or machine name; row will be skipped.",
+                )
+            elif all(_diag_value_blank(v) for v in date_time_values):
+                _add_diagnostic(
+                    diagnostics, "WARNING", "Machine_Downtime", row_no,
+                    "Unavailable Start Date",
+                    "Machine is present but downtime dates/times are blank; row will be skipped.",
+                    machine,
+                )
+            elif any(_diag_value_blank(v) for v in date_time_values):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Machine_Downtime", row_no,
+                    "Unavailable Date/Time",
+                    "All four start/end date and time fields are required.",
+                )
+        populated_counts["Machine_Downtime"] = count
+
+    if "Shifts" in workbook_sheets:
+        ws = workbook["Shifts"]
+        count = 0
+        for row_no, row in rows_until_blank(ws):
+            count += 1
+            values = list(row) + [None] * 4
+            shift, start_time, end_time, active = values[:4]
+            if _diag_value_blank(shift):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Shifts", row_no,
+                    "Shift Name", "Mandatory value is blank.",
+                )
+            if _diag_time(start_time) is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Shifts", row_no,
+                    "Start Time", "Invalid or blank shift start time.", start_time,
+                )
+            if _diag_time(end_time) is None:
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Shifts", row_no,
+                    "End Time", "Invalid or blank shift end time.", end_time,
+                )
+            if str(active or "Y").strip().upper() not in ("Y", "N"):
+                _add_diagnostic(
+                    diagnostics, "ERROR", "Shifts", row_no,
+                    "Active (Y/N)", "Allowed values are Y or N.", active,
+                )
+        populated_counts["Shifts"] = count
+
+    # Build sheet summary.
+    all_named_sheets = list(REQUIRED_SHEETS) + list(OPTIONAL_SHEETS)
+    for sheet_name in all_named_sheets:
+        if sheet_name not in workbook_sheets:
+            if not any(row["Sheet"] == sheet_name for row in sheet_summary):
+                sheet_summary.append({
+                    "Sheet": sheet_name,
+                    "Status": "Optional Missing"
+                    if sheet_name in OPTIONAL_SHEETS else "Missing",
+                    "Populated Rows": 0,
+                })
+            continue
+
+        sheet_findings = [
+            item for item in diagnostics if item["Sheet"] == sheet_name
+        ]
+        errors = sum(1 for item in sheet_findings if item["Severity"] == "ERROR")
+        warnings = sum(
+            1 for item in sheet_findings if item["Severity"] == "WARNING"
+        )
+        status = "Error" if errors else ("Warning" if warnings else "OK")
+        sheet_summary.append({
+            "Sheet": sheet_name,
+            "Status": status,
+            "Populated Rows": populated_counts.get(sheet_name, 0),
+            "Errors": errors,
+            "Warnings": warnings,
+        })
+
+    workbook.close()
+
+    error_count = sum(
+        1 for item in diagnostics if item["Severity"] == "ERROR"
+    )
+    warning_count = sum(
+        1 for item in diagnostics if item["Severity"] == "WARNING"
+    )
+
+    return {
+        "valid_for_import": error_count == 0,
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "diagnostics": diagnostics,
+        "sheet_summary": sheet_summary,
+    }
+
+
+def uploaded_file_signature(uploaded_file):
+    raw = uploaded_file.getvalue()
+    return hashlib.sha256(raw).hexdigest()
+
+
 st.title("ELECTRO-DIP")
 st.subheader("Online Production Planning System")
 st.caption(
@@ -58,8 +724,8 @@ st.caption(
 )
 
 with st.container(border=True):
-    st.markdown("### Upload & Import Excel")
-    upload_col, template_col, import_col = st.columns([2.2, 1, 1])
+    st.markdown("### Upload, Validate & Import Excel")
+    upload_col, template_col = st.columns([2.2, 1])
 
     with upload_col:
         uploaded_excel = st.file_uploader(
@@ -78,24 +744,127 @@ with st.container(border=True):
                 use_container_width=True,
             )
 
-    with import_col:
-        import_clicked = st.button(
-            "Import Excel",
-            type="primary",
-            use_container_width=True,
-        )
-
     if uploaded_excel is not None:
+        current_signature = uploaded_file_signature(uploaded_excel)
         st.caption(
             f"Selected file: {uploaded_excel.name} "
             f"({uploaded_excel.size / 1024:.1f} KB)"
         )
 
-    if import_clicked:
-        if uploaded_excel is None:
-            st.error("Please select an Excel file first.")
-        else:
+        button_col1, button_col2 = st.columns(2)
+
+        with button_col1:
+            validate_clicked = st.button(
+                "1. Validate Template",
+                type="secondary",
+                use_container_width=True,
+            )
+
+        if validate_clicked:
             try:
+                validation_result = validate_import_template(uploaded_excel)
+                st.session_state["template_validation"] = validation_result
+                st.session_state["template_validation_signature"] = (
+                    current_signature
+                )
+            except Exception as exc:
+                st.session_state.pop("template_validation", None)
+                st.session_state.pop(
+                    "template_validation_signature", None
+                )
+                st.error(f"Template validation failed: {exc}")
+
+        validation = st.session_state.get("template_validation")
+        validated_signature = st.session_state.get(
+            "template_validation_signature"
+        )
+        validation_current = (
+            validation is not None
+            and validated_signature == current_signature
+        )
+
+        with button_col2:
+            import_clicked = st.button(
+                "2. Import Excel",
+                type="primary",
+                disabled=(
+                    not validation_current
+                    or not validation.get("valid_for_import", False)
+                ),
+                use_container_width=True,
+            )
+
+        if validation_current:
+            metric1, metric2, metric3 = st.columns(3)
+            metric1.metric(
+                "Validation Status",
+                "PASS" if validation["valid_for_import"] else "FAILED",
+            )
+            metric2.metric("Errors", validation["error_count"])
+            metric3.metric("Warnings", validation["warning_count"])
+
+            summary_df = pd.DataFrame(validation["sheet_summary"])
+            st.markdown("#### Worksheet Health Check")
+            st.dataframe(
+                summary_df,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            diagnostics_df = pd.DataFrame(validation["diagnostics"])
+            if diagnostics_df.empty:
+                st.success(
+                    "No validation errors or warnings. The workbook is ready "
+                    "for import."
+                )
+            else:
+                st.markdown("#### Detailed Diagnostics")
+                severity_filter = st.multiselect(
+                    "Severity",
+                    ["ERROR", "WARNING"],
+                    default=["ERROR", "WARNING"],
+                    key="diagnostic_severity_filter",
+                )
+                filtered_diagnostics = diagnostics_df[
+                    diagnostics_df["Severity"].isin(severity_filter)
+                ]
+                st.dataframe(
+                    filtered_diagnostics,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=360,
+                )
+
+                csv_data = diagnostics_df.to_csv(
+                    index=False
+                ).encode("utf-8")
+                st.download_button(
+                    "Download Diagnostic Report CSV",
+                    data=csv_data,
+                    file_name="Electro_Dip_Import_Diagnostics.csv",
+                    mime="text/csv",
+                )
+
+            if not validation["valid_for_import"]:
+                st.error(
+                    "Import is blocked until all ERROR items are corrected. "
+                    "WARNING items do not block import."
+                )
+            elif validation["warning_count"] > 0:
+                st.warning(
+                    "Validation passed with warnings. Review them before "
+                    "importing."
+                )
+
+        elif validation is not None:
+            st.warning(
+                "The selected file changed after validation. Click "
+                "'Validate Template' again."
+            )
+
+        if import_clicked:
+            try:
+                uploaded_excel.seek(0)
                 import_report = db.import_workbook(uploaded_excel)
                 st.session_state["latest_import_report"] = import_report
                 st.success(
@@ -106,6 +875,11 @@ with st.container(border=True):
                 st.rerun()
             except Exception as exc:
                 st.error(f"Excel import failed: {exc}")
+    else:
+        st.info(
+            "Select an Excel workbook, run Validate Template, correct any "
+            "errors, and then import."
+        )
 
     if "latest_import_report" in st.session_state:
         with st.expander("Latest Import Report"):
@@ -114,7 +888,10 @@ with st.container(border=True):
             if counts:
                 st.dataframe(
                     pd.DataFrame(
-                        [{"Data Type": k, "Imported Rows": v} for k, v in counts.items()]
+                        [
+                            {"Data Type": key, "Imported Rows": value}
+                            for key, value in counts.items()
+                        ]
                     ),
                     hide_index=True,
                     use_container_width=True,
