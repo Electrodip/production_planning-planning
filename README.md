@@ -103,14 +103,3 @@ Every subsequent operation row displays its own Plan ID.
 Machine, Shift, Production Date, Production Start Time,
 Production End Time and Planned Qty are automatically populated
 from the selected Plan ID and are read-only.
-
-
-## Version 15 — Attractive Header Grid
-
-The app now includes:
-- Branded ELECTRO-DIP header with logo
-- Production Planning & WIP Control title
-- Header summary cards for schedules, plan rows, saved entries and WIP
-- Styled navigation grid with highlighted active tab
-- Responsive layout for desktop, tablet and mobile
-- Improved metric and report-table styling
