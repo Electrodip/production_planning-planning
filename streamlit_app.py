@@ -271,10 +271,101 @@ with kpi4:
         unsafe_allow_html=True,
     )
 
+
 st.markdown(
     """
     <div style="
-        margin: 10px 0 8px 2px;
+        margin: 6px 0 10px 2px;
+        color: #173B63;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0.45px;
+        text-transform: uppercase;">
+        Upload & Import Excel
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.container(border=True):
+    import_col1, import_col2, import_col3 = st.columns([2.2, 1, 1])
+
+    with import_col1:
+        uploaded_excel = st.file_uploader(
+            "Select Production Planning Excel",
+            type=["xlsx", "xlsm"],
+            key="master_excel_upload",
+            help="Use the Electro-Dip WIP Import Template.",
+        )
+
+    with import_col2:
+        if TEMPLATE_PATH.exists():
+            st.download_button(
+                "Download Import Template",
+                data=TEMPLATE_PATH.read_bytes(),
+                file_name=TEMPLATE_PATH.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    with import_col3:
+        import_clicked = st.button(
+            "Import Excel",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if uploaded_excel is not None:
+        st.caption(
+            f"Selected file: {uploaded_excel.name} "
+            f"({uploaded_excel.size / 1024:.1f} KB)"
+        )
+
+    if import_clicked:
+        if uploaded_excel is None:
+            st.error("Please select an Excel file before clicking Import Excel.")
+        else:
+            try:
+                import_report = db.import_workbook(uploaded_excel)
+                st.session_state["latest_import_report"] = import_report
+                st.success(
+                    "Excel imported successfully. "
+                    f"Previous operator entries preserved: "
+                    f"{import_report['previous_entries_preserved']}"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Excel import failed: {exc}")
+
+    if "latest_import_report" in st.session_state:
+        latest_report = st.session_state["latest_import_report"]
+        with st.expander("View Latest Import Report"):
+            if latest_report.get("counts"):
+                st.markdown("#### Imported Records")
+                counts_df = pd.DataFrame(
+                    [
+                        {"Data Type": key, "Imported Rows": value}
+                        for key, value in latest_report["counts"].items()
+                    ]
+                )
+                st.dataframe(
+                    counts_df,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            warnings = latest_report.get("warnings", [])
+            if warnings:
+                st.markdown("#### Import Warnings")
+                for warning in warnings[:100]:
+                    st.write("•", warning)
+            else:
+                st.success("No import warnings.")
+
+st.markdown(
+    """
+    <div style="
+        margin: 12px 0 8px 2px;
         color: #173B63;
         font-size: 13px;
         font-weight: 800;

@@ -161,3 +161,16 @@ Improvements:
 - Four KPI cards
 - Styled tabs and data grids
 - Responsive layout handled by Streamlit columns
+
+
+## Version 19 — Visible Excel Import Panel
+
+The main screen now contains a visible Upload & Import Excel section with:
+- Excel file uploader
+- Import Template download
+- Selected filename and size
+- Import Excel button
+- Success/error message
+- Import counts
+- Import warnings
+- Previous operator-entry preservation confirmation
