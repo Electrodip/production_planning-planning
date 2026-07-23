@@ -49,3 +49,30 @@ Download workbook includes Schedule_Line_Calculation, Process_WIP_Allocation, WI
 - Customer-wise WIP
 - Dispatch history
 - All reports included in downloadable Excel
+
+
+## Version 10 complete modules
+
+- Production Plan screen with Generate / Regenerate button
+- Downloadable Production Plan Excel
+- Machine-wise Operator Slips tab
+- Approved ELECTRO-DIP operator-slip PDF
+- One slip page per machine and selected due date
+- Multiple planned operations on one slip
+- Actual Qty and Rejected Qty columns on every slip row
+- Existing persistent Operator Entry and all WIP reports retained
+
+
+## Version 11 timed production plan
+
+Production Plan and Operator Slips now include:
+- Production Start Date and Time
+- Production End Date and Time
+- Shift Name
+- Backward scheduling from customer due date
+- Cycle time and setup time
+- Shift calendar and breaks
+- Holidays and weekly offs
+- Machine downtime
+- Recommended-machine capacity selection
+- Outsource lead-time scheduling

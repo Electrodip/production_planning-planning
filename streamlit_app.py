@@ -1,5 +1,6 @@
 
 import os
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -21,7 +22,32 @@ def get_db():
     return Database(DB_PATH)
 
 
+
 db = get_db()
+
+
+def make_operator_slip_pdf_bytes(selected_date=None, selected_machine=None):
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        db.create_operator_slips_pdf(
+            path,
+            due_date=selected_date,
+            machine_name=selected_machine,
+        )
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def make_production_plan_excel_bytes():
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        db.export_production_plan_excel(path)
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
 
 st.title("ELECTRO-DIP")
 st.subheader("Online Production Planning System with Persistent WIP")
@@ -69,7 +95,7 @@ if "import_report" in st.session_state:
                 st.write("•", warning)
 
 tabs = st.tabs([
-    "Dashboard", "Production Plan", "Operator Entry",
+    "Dashboard", "Production Plan", "Operator Slips", "Operator Entry",
     "Process WIP Report", "WIP Ageing", "WIP Summaries",
     "Schedule Calculation", "Process WIP Allocation",
     "Previous Entries", "Download Excel", "Clear Data"
@@ -99,14 +125,98 @@ with tabs[0]:
     )
 
 with tabs[1]:
-    st.subheader("WIP-Adjusted Production Plan")
-    plan_df = pd.DataFrame([dict(r) for r in db.plan_rows()])
+    st.subheader("Production Plan")
+    p1, p2 = st.columns([1, 1])
+    with p1:
+        if st.button("Generate / Regenerate Production Plan", type="primary"):
+            count = db.generate_plan()
+            st.success(f"Production plan generated: {count} rows")
+    with p2:
+        plan_rows_for_download = db.production_plan_report_rows()
+        if plan_rows_for_download:
+            st.download_button(
+                "Download Production Plan Excel",
+                data=make_production_plan_excel_bytes(),
+                file_name="Electro_Dip_Production_Plan.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    plan_df = pd.DataFrame(db.production_plan_report_rows())
     if plan_df.empty:
-        st.info("Generate the plan to view results.")
+        st.info(
+            "No production plan is available. Import the Excel template and "
+            "click Generate / Regenerate Production Plan."
+        )
     else:
-        st.dataframe(plan_df, hide_index=True, use_container_width=True, height=560)
+        st.dataframe(
+            plan_df,
+            hide_index=True,
+            use_container_width=True,
+            height=570,
+        )
+        st.caption(
+            "The plan is WIP-adjusted, transportation-batch split, and "
+            "backward scheduled using shifts, breaks, holidays, weekly offs, "
+            "machine downtime, cycle time and setup time."
+        )
 
 with tabs[2]:
+    st.subheader("Machine-wise Operator Slips")
+    slip_dates = db.operator_slip_dates()
+    if not slip_dates:
+        st.info("Generate the production plan before creating operator slips.")
+    else:
+        s1, s2 = st.columns(2)
+        selected_slip_date = s1.selectbox(
+            "Production Date",
+            slip_dates,
+            format_func=lambda d: d.strftime("%d-%b-%Y"),
+        )
+        machines = ["All Machines"] + db.operator_slip_machines(selected_slip_date)
+        selected_machine_label = s2.selectbox("Machine", machines)
+        selected_machine = (
+            None if selected_machine_label == "All Machines"
+            else selected_machine_label
+        )
+
+        slip_rows = db.operator_slip_rows(
+            due_date=selected_slip_date,
+            machine_name=selected_machine,
+        )
+        slip_df = pd.DataFrame(slip_rows)
+        if not slip_df.empty:
+            preferred = [
+                "machine_name", "customer_name", "part_name",
+                "process_sequence", "operation_name", "planned_qty",
+                "production_start_datetime", "production_end_datetime",
+                "shift_name", "lot_no", "schedule_id",
+                "due_datetime", "priority"
+            ]
+            visible = [c for c in preferred if c in slip_df.columns]
+            st.dataframe(
+                slip_df[visible],
+                hide_index=True,
+                use_container_width=True,
+                height=440,
+            )
+            st.download_button(
+                "Download / Print Operator Slip PDF",
+                data=make_operator_slip_pdf_bytes(
+                    selected_slip_date,
+                    selected_machine,
+                ),
+                file_name=(
+                    f"Operator_Slips_{selected_slip_date.isoformat()}.pdf"
+                ),
+                mime="application/pdf",
+                type="primary",
+            )
+            st.caption(
+                "One page is generated per machine. Multiple operations are "
+                "printed on the same approved ELECTRO-DIP slip."
+            )
+
+with tabs[3]:
     st.subheader("Daily Operator Entry")
     bom_df = pd.DataFrame([dict(r) for r in db.bom_rows()])
     if bom_df.empty:
@@ -170,7 +280,7 @@ with tabs[2]:
                 )
 
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("Process-wise WIP Report")
     report_df = pd.DataFrame(db.process_wip_report_rows())
     if report_df.empty:
@@ -199,7 +309,7 @@ with tabs[3]:
         st.dataframe(filtered, hide_index=True, use_container_width=True, height=540)
         st.caption("WIP Qty = normalized cumulative good at current process minus normalized cumulative good at next process.")
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("WIP Ageing")
     ageing_df = pd.DataFrame(db.process_wip_report_rows())
     ageing_df = ageing_df[ageing_df["wip_qty"] > 0] if not ageing_df.empty else ageing_df
@@ -216,7 +326,7 @@ with tabs[4]:
             hide_index=True, use_container_width=True, height=520
         )
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Machine / Part / Customer WIP")
     s1, s2, s3 = st.columns(3)
     with s1:
@@ -229,7 +339,7 @@ with tabs[5]:
         st.markdown("#### Customer-wise")
         st.dataframe(pd.DataFrame(db.customer_wip_rows()), hide_index=True, use_container_width=True)
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Schedule-Line Plan Quantity Calculation")
     schedule_calc_df = pd.DataFrame(db.schedule_line_calculation_rows())
     if schedule_calc_df.empty:
@@ -238,7 +348,7 @@ with tabs[6]:
         st.dataframe(schedule_calc_df, hide_index=True, use_container_width=True, height=520)
         st.caption("First line: Demand + Minimum Stock - Opening Available. Further lines: Demand + Minimum Stock - Previous Schedule Carry-Forward WIP.")
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("Process-BOM-Wise WIP Allocation")
     process_wip_df = pd.DataFrame(db.process_schedule_wip_rows())
     if process_wip_df.empty:
@@ -246,7 +356,7 @@ with tabs[7]:
     else:
         st.dataframe(process_wip_df, hide_index=True, use_container_width=True, height=520)
 
-with tabs[8]:
+with tabs[9]:
     st.subheader("Saved Previous Operator Entries")
     entries_df = pd.DataFrame([dict(r) for r in db.operator_entries()])
     if entries_df.empty:
@@ -254,7 +364,7 @@ with tabs[8]:
     else:
         st.dataframe(entries_df, hide_index=True, use_container_width=True, height=560)
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("Download Complete WIP Workbook")
     if st.button("Prepare Downloadable Excel"):
         export_path = BASE_DIR / "Electro_Dip_WIP_Report.xlsx"
@@ -272,7 +382,7 @@ with tabs[9]:
         "Workbook sheets include Process WIP Report, WIP Ageing data, Machine WIP, Part WIP, Customer WIP, Dispatch History, Schedule Calculation, Production Plan and Operator Entries."
     )
 
-with tabs[10]:
+with tabs[11]:
     st.subheader("Clear Previous Entries")
     st.error(
         "This is the only action that deletes saved operator entries and WIP history."
