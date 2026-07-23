@@ -953,10 +953,23 @@ class Database:
         )
 
     def schedule_line_calculation_rows(self):
-        """Apply first-line and further-line WIP rules part-wise and FIFO."""
+        """
+        Schedule calculation without WIP deduction.
+
+        Schedule Plan Qty =
+            Customer Demand + Minimum Stock Level - Allocated Current FG Stock
+
+        Important:
+        - Opening WIP is not deducted.
+        - Previous-schedule carry-forward WIP is not deducted.
+        - Process WIP is handled only after schedule quantity calculation.
+        - Current finished-goods stock is allocated FIFO because it is FG stock,
+          not process WIP.
+        """
         results = []
         part_rows = self.conn.execute(
-            """SELECT DISTINCT part_name FROM customer_schedules
+            """SELECT DISTINCT part_name
+               FROM customer_schedules
                ORDER BY part_name"""
         ).fetchall()
 
@@ -968,22 +981,23 @@ class Database:
                    ORDER BY due_datetime, priority, schedule_id""",
                 (part,)
             ).fetchall()
+
             stock = self.conn.execute(
-                "SELECT * FROM stock_demand WHERE part_name=?", (part,)
+                "SELECT * FROM stock_demand WHERE part_name=?",
+                (part,)
             ).fetchone()
+
             minimum_stock = float(stock["minimum_stock"] or 0) if stock else 0.0
-            current_stock = float(stock["current_stock"] or 0) if stock else 0.0
-            opening_wip = self.opening_wip_total(part)
-            dispatched = self.total_dispatched_by_part(part)
-            carry_forward = max(current_stock + opening_wip + dispatched, 0.0)
+            current_stock_pool = float(stock["current_stock"] or 0) if stock else 0.0
 
             for line_no, schedule in enumerate(schedules, start=1):
                 demand = float(schedule["customer_qty"] or 0)
                 gross_requirement = demand + minimum_stock
-                available_before = carry_forward
-                wip_used = min(available_before, gross_requirement)
-                plan_qty = max(gross_requirement - wip_used, 0.0)
-                carry_forward = max(available_before - gross_requirement, 0.0)
+
+                allocated_fg_stock = min(current_stock_pool, gross_requirement)
+                current_stock_pool = max(current_stock_pool - allocated_fg_stock, 0.0)
+
+                plan_qty = max(gross_requirement - allocated_fg_stock, 0.0)
 
                 results.append({
                     "line_no": line_no,
@@ -995,21 +1009,20 @@ class Database:
                     "customer_demand": demand,
                     "minimum_stock_level": minimum_stock,
                     "gross_requirement": gross_requirement,
-                    "current_stock_opening": current_stock if line_no == 1 else 0.0,
-                    "opening_wip_stock": opening_wip if line_no == 1 else 0.0,
-                    "dispatched_good_opening": dispatched if line_no == 1 else 0.0,
-                    "previous_schedule_carry_forward_wip": available_before if line_no > 1 else 0.0,
-                    "total_available_before_line": available_before,
-                    "wip_used_for_line": wip_used,
+                    "allocated_current_fg_stock": allocated_fg_stock,
+                    "opening_wip_stock": 0.0,
+                    "previous_schedule_carry_forward_wip": 0.0,
+                    "wip_used_for_line": 0.0,
                     "plan_qty": plan_qty,
-                    "carry_forward_wip_after_line": carry_forward,
+                    "carry_forward_wip_after_line": 0.0,
                     "calculation_rule": (
-                        "FIRST: Demand + Min Stock - Opening Available"
-                        if line_no == 1 else
-                        "NEXT: Demand + Min Stock - Previous Carry-Forward WIP"
+                        "Demand + Minimum Stock - Allocated Current FG Stock; "
+                        "WIP not considered in schedule calculation"
                     ),
                 })
+
         return results
+
 
     def process_schedule_wip_rows(self):
         output = []
@@ -1257,7 +1270,7 @@ class Database:
                         process_type = str(op["process_type"] or "INHOUSE").upper()
                         note = (
                             f"Gross {schedule['gross_requirement']:g}; "
-                            f"schedule WIP used {schedule['wip_used_for_line']:g}; "
+                            "schedule WIP not considered; "
                             f"process WIP used {process_wip_used:g}; "
                             "backward scheduled"
                         )

@@ -150,39 +150,17 @@ Rules:
 - Dispatch is therefore limited by the good output of the previous operation.
 
 
-## Version 18 — Stable Attractive Header
+## Version 21 — V14 Interface and No WIP in Schedule Calculation
 
-The previous HTML grid was replaced with native Streamlit columns.
+Interface:
+- Restored simple V14-style Streamlit layout
+- Clear title, import panel and normal module tabs
+- Removed custom header grid
 
-Improvements:
-- No raw HTML text leakage
-- Logo rendered with st.image
-- Stable branded title section
-- Four KPI cards
-- Styled tabs and data grids
-- Responsive layout handled by Streamlit columns
-
-
-## Version 19 — Visible Excel Import Panel
-
-The main screen now contains a visible Upload & Import Excel section with:
-- Excel file uploader
-- Import Template download
-- Selected filename and size
-- Import Excel button
-- Success/error message
-- Import counts
-- Import warnings
-- Previous operator-entry preservation confirmation
-
-
-## Version 20 — Compact ERP Header Redesign
-
-- Smaller 68 px logo
-- Compact branded title bar
-- Four aligned KPI cards
-- Single-row import toolbar
-- Upload, template, import and refresh controls together
-- Cleaner navigation spacing
-- Reduced empty space
-- More stable responsive layout
+Schedule calculation:
+- Schedule Plan Qty = Demand + Minimum Stock - Allocated Current FG Stock
+- Opening WIP is not deducted
+- Previous-schedule WIP is not deducted
+- Process WIP is considered only after schedule quantity calculation
+- Transportation batch splits the exact process quantity
+- All later features remain included

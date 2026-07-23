@@ -1,6 +1,7 @@
 
 import os
 import tempfile
+import base64
 from datetime import date
 from pathlib import Path
 
@@ -49,258 +50,28 @@ def make_production_plan_excel_bytes():
     finally:
         path.unlink(missing_ok=True)
 
-logo_path = BASE_DIR / "electro_dip_logo.png"
-
-st.markdown(
-    """
-    <style>
-        .block-container {
-            padding-top: 0.65rem;
-            padding-bottom: 1.5rem;
-            max-width: 98%;
-        }
-
-        .ed-topbar {
-            background: linear-gradient(90deg, #173B63 0%, #245B8E 60%, #2F75B5 100%);
-            border-radius: 14px;
-            padding: 14px 18px;
-            min-height: 84px;
-            box-shadow: 0 6px 18px rgba(31, 78, 120, 0.18);
-            border: 1px solid rgba(255,255,255,0.15);
-        }
-
-        .ed-company {
-            color: #FFFFFF;
-            font-size: 27px;
-            font-weight: 800;
-            line-height: 1.05;
-            letter-spacing: 0.4px;
-            margin-bottom: 4px;
-        }
-
-        .ed-system {
-            color: #EAF3FB;
-            font-size: 14px;
-            font-weight: 700;
-            margin-bottom: 3px;
-        }
-
-        .ed-subline {
-            color: #D0E3F3;
-            font-size: 11px;
-            line-height: 1.4;
-        }
-
-        .ed-kpi-card {
-            background: #FFFFFF;
-            border: 1px solid #D9E4EE;
-            border-radius: 13px;
-            min-height: 84px;
-            padding: 12px 10px;
-            box-shadow: 0 4px 12px rgba(31, 78, 120, 0.08);
-            text-align: center;
-        }
-
-        .ed-kpi-card.blue { border-top: 4px solid #2F75B5; }
-        .ed-kpi-card.green { border-top: 4px solid #70AD47; }
-        .ed-kpi-card.orange { border-top: 4px solid #ED7D31; }
-        .ed-kpi-card.red { border-top: 4px solid #C00000; }
-
-        .ed-kpi-label {
-            color: #667788;
-            font-size: 10px;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.45px;
-            margin-bottom: 5px;
-        }
-
-        .ed-kpi-value {
-            color: #18232D;
-            font-size: 25px;
-            font-weight: 800;
-            line-height: 1;
-        }
-
-        .ed-kpi-note {
-            color: #8A98A5;
-            font-size: 9px;
-            margin-top: 6px;
-        }
-
-        .ed-section-label {
-            margin: 10px 0 7px 2px;
-            color: #173B63;
-            font-size: 12px;
-            font-weight: 800;
-            letter-spacing: 0.45px;
-            text-transform: uppercase;
-        }
-
-        div[data-testid="stFileUploader"] {
-            border: 1px dashed #AFC4D8;
-            border-radius: 10px;
-            padding: 3px 6px;
-            background: #FBFDFF;
-        }
-
-        div[data-testid="stVerticalBlockBorderWrapper"] {
-            border-radius: 12px;
-            border-color: #D9E4EE !important;
-            box-shadow: 0 3px 10px rgba(31, 78, 120, 0.05);
-        }
-
-        div[data-baseweb="tab-list"] {
-            background: #FFFFFF;
-            border: 1px solid #D9E2EA;
-            border-radius: 12px;
-            padding: 6px 7px 2px 7px;
-            gap: 2px;
-            box-shadow: 0 3px 10px rgba(31, 78, 120, 0.07);
-            overflow-x: auto;
-        }
-
-        button[data-baseweb="tab"] {
-            border-radius: 8px 8px 0 0;
-            padding-left: 12px !important;
-            padding-right: 12px !important;
-            font-weight: 650 !important;
-            color: #30475C !important;
-            white-space: nowrap;
-        }
-
-        button[data-baseweb="tab"][aria-selected="true"] {
-            color: #C00000 !important;
-            background: #FFF3F1 !important;
-        }
-
-        div[data-baseweb="tab-highlight"] {
-            background-color: #C00000 !important;
-            height: 3px !important;
-        }
-
-        div[data-testid="stDataFrame"] {
-            border: 1px solid #DDE5EC;
-            border-radius: 10px;
-            overflow: hidden;
-            box-shadow: 0 3px 10px rgba(31, 78, 120, 0.05);
-        }
-
-        @media (max-width: 1050px) {
-            .ed-company { font-size: 23px; }
-            .ed-system { font-size: 12px; }
-            .ed-subline { font-size: 10px; }
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.title("ELECTRO-DIP")
+st.subheader("Online Production Planning System")
+st.caption(
+    "Production planning, operator slips, persistent entries, "
+    "transportation lots, operation sequence control and WIP reports."
 )
-
-header_schedule_count = db.conn.execute(
-    "SELECT COUNT(*) FROM customer_schedules"
-).fetchone()[0]
-header_plan_count = db.conn.execute(
-    "SELECT COUNT(*) FROM production_plan"
-).fetchone()[0]
-header_entry_count = db.conn.execute(
-    "SELECT COUNT(*) FROM operator_entries"
-).fetchone()[0]
-header_wip_total = sum(
-    float(row["wip_after_process"] or 0)
-    for row in db.wip_rows()
-)
-
-brand, k1, k2, k3, k4 = st.columns([2.55, 1, 1, 1, 1], gap="small")
-
-with brand:
-    logo_col, text_col = st.columns([0.28, 1.72], gap="small")
-    with logo_col:
-        if logo_path.exists():
-            st.image(str(logo_path), width=68)
-    with text_col:
-        st.markdown(
-            """
-            <div class="ed-topbar">
-                <div class="ed-company">ELECTRO-DIP</div>
-                <div class="ed-system">Production Planning & WIP Control System</div>
-                <div class="ed-subline">
-                    Backward scheduling • Machine-wise slips • Persistent entries •
-                    Process-wise WIP reporting
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-with k1:
-    st.markdown(
-        f"""
-        <div class="ed-kpi-card blue">
-            <div class="ed-kpi-label">Schedules</div>
-            <div class="ed-kpi-value">{header_schedule_count:,}</div>
-            <div class="ed-kpi-note">Customer lines</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k2:
-    st.markdown(
-        f"""
-        <div class="ed-kpi-card green">
-            <div class="ed-kpi-label">Plan Rows</div>
-            <div class="ed-kpi-value">{header_plan_count:,}</div>
-            <div class="ed-kpi-note">Operations</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k3:
-    st.markdown(
-        f"""
-        <div class="ed-kpi-card orange">
-            <div class="ed-kpi-label">Saved Entries</div>
-            <div class="ed-kpi-value">{header_entry_count:,}</div>
-            <div class="ed-kpi-note">Operator updates</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k4:
-    st.markdown(
-        f"""
-        <div class="ed-kpi-card red">
-            <div class="ed-kpi-label">Physical WIP</div>
-            <div class="ed-kpi-value">{header_wip_total:,.0f}</div>
-            <div class="ed-kpi-note">Current WIP qty</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown('<div class="ed-section-label">Data Import</div>', unsafe_allow_html=True)
 
 with st.container(border=True):
-    upload_col, template_col, import_col, refresh_col = st.columns(
-        [2.4, 1, 1, 0.8],
-        gap="small",
-    )
+    st.markdown("### Upload & Import Excel")
+    upload_col, template_col, import_col = st.columns([2.2, 1, 1])
 
     with upload_col:
         uploaded_excel = st.file_uploader(
-            "Upload Production Planning Excel",
+            "Select Production Planning Excel",
             type=["xlsx", "xlsm"],
             key="master_excel_upload",
-            help="Use the Electro-Dip import template.",
-            label_visibility="collapsed",
         )
 
     with template_col:
         if TEMPLATE_PATH.exists():
             st.download_button(
-                "Download Template",
+                "Download Import Template",
                 data=TEMPLATE_PATH.read_bytes(),
                 file_name=TEMPLATE_PATH.name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -314,19 +85,15 @@ with st.container(border=True):
             use_container_width=True,
         )
 
-    with refresh_col:
-        if st.button("Refresh", use_container_width=True):
-            st.rerun()
-
     if uploaded_excel is not None:
         st.caption(
-            f"Selected: {uploaded_excel.name} "
+            f"Selected file: {uploaded_excel.name} "
             f"({uploaded_excel.size / 1024:.1f} KB)"
         )
 
     if import_clicked:
         if uploaded_excel is None:
-            st.error("Select an Excel file before importing.")
+            st.error("Please select an Excel file first.")
         else:
             try:
                 import_report = db.import_workbook(uploaded_excel)
@@ -341,23 +108,23 @@ with st.container(border=True):
                 st.error(f"Excel import failed: {exc}")
 
     if "latest_import_report" in st.session_state:
-        latest_report = st.session_state["latest_import_report"]
         with st.expander("Latest Import Report"):
+            latest_report = st.session_state["latest_import_report"]
             counts = latest_report.get("counts", {})
             if counts:
-                counts_df = pd.DataFrame(
-                    [{"Data Type": k, "Imported Rows": v} for k, v in counts.items()]
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"Data Type": k, "Imported Rows": v} for k, v in counts.items()]
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
                 )
-                st.dataframe(counts_df, hide_index=True, use_container_width=True)
-
             warnings = latest_report.get("warnings", [])
             if warnings:
                 for warning in warnings[:100]:
                     st.write("•", warning)
             else:
                 st.success("No import warnings.")
-
-st.markdown('<div class="ed-section-label">Application Modules</div>', unsafe_allow_html=True)
 
 tabs = st.tabs([
     "Dashboard", "Production Plan", "Operator Slips", "Operator Entry",
