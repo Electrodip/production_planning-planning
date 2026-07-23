@@ -1,6 +1,7 @@
 
 import os
 import tempfile
+import base64
 from datetime import date
 from pathlib import Path
 
@@ -49,11 +50,239 @@ def make_production_plan_excel_bytes():
     finally:
         path.unlink(missing_ok=True)
 
-st.title("ELECTRO-DIP")
-st.subheader("Online Production Planning System with Persistent WIP")
-st.caption(
-    "Operator entries and WIP remain saved through imports and plan regeneration. "
-    "They are deleted only from the Clear Data tab."
+logo_path = BASE_DIR / "electro_dip_logo.png"
+logo_html = ""
+if logo_path.exists():
+    encoded_logo = base64.b64encode(logo_path.read_bytes()).decode("utf-8")
+    logo_html = (
+        f'<img src="data:image/png;base64,{encoded_logo}" '
+        'class="ed-logo" alt="Electro-Dip logo">'
+    )
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 1.1rem;
+            padding-bottom: 2rem;
+            max-width: 98%;
+        }
+
+        .ed-header {
+            display: grid;
+            grid-template-columns: minmax(340px, 1.55fr) repeat(4, minmax(135px, 0.42fr));
+            gap: 14px;
+            align-items: stretch;
+            margin-bottom: 14px;
+        }
+
+        .ed-brand-card {
+            background: linear-gradient(135deg, #173B63 0%, #245B8E 65%, #2F75B5 100%);
+            border-radius: 16px;
+            padding: 18px 22px;
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            min-height: 118px;
+            box-shadow: 0 8px 26px rgba(31, 78, 120, 0.22);
+            border: 1px solid rgba(255,255,255,0.16);
+        }
+
+        .ed-logo {
+            width: 78px;
+            height: 58px;
+            object-fit: contain;
+            background: #ffffff;
+            border-radius: 11px;
+            padding: 6px;
+            box-shadow: 0 3px 12px rgba(0,0,0,0.18);
+        }
+
+        .ed-brand-title {
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 31px;
+            line-height: 1.05;
+            letter-spacing: 0.3px;
+            margin-bottom: 7px;
+        }
+
+        .ed-brand-subtitle {
+            color: #E8F2FB;
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .ed-brand-caption {
+            color: #CFE3F5;
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
+        .ed-stat-card {
+            border-radius: 15px;
+            padding: 16px 15px;
+            min-height: 118px;
+            background: #ffffff;
+            border: 1px solid #DCE6EF;
+            box-shadow: 0 5px 18px rgba(44, 62, 80, 0.09);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .ed-stat-card.blue { border-top: 5px solid #2F75B5; }
+        .ed-stat-card.green { border-top: 5px solid #70AD47; }
+        .ed-stat-card.orange { border-top: 5px solid #ED7D31; }
+        .ed-stat-card.red { border-top: 5px solid #C00000; }
+
+        .ed-stat-label {
+            color: #6B7785;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.45px;
+            margin-bottom: 8px;
+        }
+
+        .ed-stat-value {
+            color: #1F2937;
+            font-size: 27px;
+            font-weight: 800;
+            line-height: 1;
+        }
+
+        .ed-stat-note {
+            color: #8B98A5;
+            font-size: 10px;
+            margin-top: 8px;
+        }
+
+        div[data-baseweb="tab-list"] {
+            background: linear-gradient(180deg, #FFFFFF 0%, #F4F7FA 100%);
+            border: 1px solid #D9E2EA;
+            border-radius: 13px;
+            padding: 7px 8px 2px 8px;
+            gap: 2px;
+            box-shadow: 0 4px 14px rgba(31, 78, 120, 0.08);
+            overflow-x: auto;
+        }
+
+        button[data-baseweb="tab"] {
+            border-radius: 8px 8px 0 0;
+            padding-left: 13px !important;
+            padding-right: 13px !important;
+            font-weight: 650 !important;
+            color: #31465A !important;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: #C00000 !important;
+            background: #FFF4F2 !important;
+        }
+
+        div[data-baseweb="tab-highlight"] {
+            background-color: #C00000 !important;
+            height: 3px !important;
+            border-radius: 3px 3px 0 0 !important;
+        }
+
+        div[data-testid="stMetric"] {
+            background: #FFFFFF;
+            border: 1px solid #DDE5EC;
+            border-radius: 12px;
+            padding: 13px 15px;
+            box-shadow: 0 4px 12px rgba(31, 78, 120, 0.07);
+        }
+
+        div[data-testid="stDataFrame"] {
+            border: 1px solid #DDE5EC;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 3px 12px rgba(31, 78, 120, 0.06);
+        }
+
+        @media (max-width: 1100px) {
+            .ed-header {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .ed-brand-card {
+                grid-column: 1 / -1;
+            }
+        }
+
+        @media (max-width: 650px) {
+            .ed-header {
+                grid-template-columns: 1fr;
+            }
+            .ed-brand-card {
+                grid-column: auto;
+            }
+            .ed-brand-title {
+                font-size: 25px;
+            }
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+header_schedule_count = db.conn.execute(
+    "SELECT COUNT(*) FROM customer_schedules"
+).fetchone()[0]
+header_plan_count = db.conn.execute(
+    "SELECT COUNT(*) FROM production_plan"
+).fetchone()[0]
+header_entry_count = db.conn.execute(
+    "SELECT COUNT(*) FROM operator_entries"
+).fetchone()[0]
+header_wip_total = sum(
+    float(row["wip_after_process"] or 0)
+    for row in db.wip_rows()
+)
+
+st.markdown(
+    f"""
+    <div class="ed-header">
+        <div class="ed-brand-card">
+            {logo_html}
+            <div>
+                <div class="ed-brand-title">ELECTRO-DIP</div>
+                <div class="ed-brand-subtitle">Production Planning & WIP Control System</div>
+                <div class="ed-brand-caption">
+                    Backward scheduling • Machine-wise operator slips •
+                    Persistent shop-floor entries • Process-wise WIP reporting
+                </div>
+            </div>
+        </div>
+
+        <div class="ed-stat-card blue">
+            <div class="ed-stat-label">Schedules</div>
+            <div class="ed-stat-value">{header_schedule_count:,}</div>
+            <div class="ed-stat-note">Imported customer lines</div>
+        </div>
+
+        <div class="ed-stat-card green">
+            <div class="ed-stat-label">Plan Rows</div>
+            <div class="ed-stat-value">{header_plan_count:,}</div>
+            <div class="ed-stat-note">Generated operations</div>
+        </div>
+
+        <div class="ed-stat-card orange">
+            <div class="ed-stat-label">Saved Entries</div>
+            <div class="ed-stat-value">{header_entry_count:,}</div>
+            <div class="ed-stat-note">Persistent operator updates</div>
+        </div>
+
+        <div class="ed-stat-card red">
+            <div class="ed-stat-label">Physical WIP</div>
+            <div class="ed-stat-value">{header_wip_total:,.0f}</div>
+            <div class="ed-stat-note">Current process WIP qty</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 with st.sidebar:
@@ -93,6 +322,21 @@ if "import_report" in st.session_state:
         if report["warnings"]:
             for warning in report["warnings"][:50]:
                 st.write("•", warning)
+
+st.markdown(
+    """
+    <div style="
+        margin: 4px 0 8px 2px;
+        color: #173B63;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0.45px;
+        text-transform: uppercase;">
+        Application Modules
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 tabs = st.tabs([
     "Dashboard", "Production Plan", "Operator Slips", "Operator Entry",
@@ -238,7 +482,9 @@ with tabs[3]:
             st.write(
                 f"{plan_detail['part_name']} | "
                 f"{plan_detail['operation_name']} | "
-                f"{plan_detail['planned_qty']:g}"
+                f"{plan_detail.get('machine_name') or '-'} | "
+                f"{plan_detail.get('shift_name') or '-'} | "
+                f"Qty {plan_detail['planned_qty']:g}"
             )
 
         part = str(plan_detail["part_name"])
@@ -254,15 +500,18 @@ with tabs[3]:
             if production_start else date.today()
         )
 
-        machine_values = db.machine_dropdown_values()
-        selected_machine_default = str(plan_detail.get("machine_name") or "")
-        if selected_machine_default and selected_machine_default not in machine_values:
-            machine_values = [selected_machine_default] + machine_values
+        machine = str(plan_detail.get("machine_name") or "")
+        shift = str(plan_detail.get("shift_name") or "")
+        production_end = plan_detail.get("production_end_datetime")
 
-        shift_values = db.shift_dropdown_values()
-        selected_shift_default = str(plan_detail.get("shift_name") or "")
-        if selected_shift_default and selected_shift_default not in shift_values:
-            shift_values = [selected_shift_default] + shift_values
+        start_time_text = (
+            pd.to_datetime(production_start).strftime("%H:%M")
+            if production_start else ""
+        )
+        end_time_text = (
+            pd.to_datetime(production_end).strftime("%H:%M")
+            if production_end else ""
+        )
 
         c1, c2 = st.columns(2)
         c1.text_input("Part Number", value=part, disabled=True)
@@ -273,50 +522,47 @@ with tabs[3]:
         )
 
         c3, c4, c5 = st.columns(3)
-        entry_date = c3.date_input(
-            "Entry Date",
-            value=production_date,
-            key=f"entry_date_{selected_plan_id}",
+        c3.text_input(
+            "Production Date",
+            value=production_date.strftime("%Y/%m/%d"),
+            disabled=True,
         )
-        machine = c4.selectbox(
-            "Machine",
-            machine_values if machine_values else [""],
-            index=(
-                machine_values.index(selected_machine_default)
-                if selected_machine_default in machine_values else 0
-            ),
-            key=f"machine_{selected_plan_id}",
-        )
-        shift = c5.selectbox(
-            "Shift",
-            shift_values if shift_values else [""],
-            index=(
-                shift_values.index(selected_shift_default)
-                if selected_shift_default in shift_values else 0
-            ),
-            key=f"shift_{selected_plan_id}",
-        )
+        c4.text_input("Machine", value=machine, disabled=True)
+        c5.text_input("Shift", value=shift, disabled=True)
 
         c6, c7, c8 = st.columns(3)
-        actual = c6.number_input(
+        c6.text_input(
+            "Production Start Time",
+            value=start_time_text,
+            disabled=True,
+        )
+        c7.text_input(
+            "Production End Time",
+            value=end_time_text,
+            disabled=True,
+        )
+        c8.text_input(
+            "Planned Qty",
+            value=f"{planned_default:g}",
+            disabled=True,
+        )
+
+        c9, c10 = st.columns(2)
+        actual = c9.number_input(
             "Actual Qty",
             min_value=0.0,
             step=1.0,
             key=f"actual_{selected_plan_id}",
         )
-        rejected = c7.number_input(
+        rejected = c10.number_input(
             "Rejected Qty",
             min_value=0.0,
             step=1.0,
             key=f"rejected_{selected_plan_id}",
         )
-        planned = c8.number_input(
-            "Planned Qty",
-            min_value=0.0,
-            value=planned_default,
-            step=1.0,
-            key=f"planned_{selected_plan_id}",
-        )
+
+        entry_date = production_date
+        planned = planned_default
 
         operator_names = db.personnel_names("OPERATOR")
         supervisor_names = db.personnel_names("SUPERVISOR")
@@ -391,7 +637,7 @@ with tabs[3]:
             dict(r) for r in db.operator_entries()
             if str(r["entry_date"]) == entry_date.isoformat()
         ])
-        st.markdown(f"#### Today's Entries ({entry_date:%d-%b-%Y})")
+        st.markdown(f"#### Entries for Production Date ({entry_date:%d-%b-%Y})")
         if today_entries.empty:
             st.info("No entries for the selected date.")
         else:
