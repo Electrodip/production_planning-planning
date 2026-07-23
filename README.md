@@ -148,3 +148,16 @@ Rules:
 - Quantity already processed at the current operation is deducted.
 - Validation is enforced both in the screen and in the database save method.
 - Dispatch is therefore limited by the good output of the previous operation.
+
+
+## Version 18 — Stable Attractive Header
+
+The previous HTML grid was replaced with native Streamlit columns.
+
+Improvements:
+- No raw HTML text leakage
+- Logo rendered with st.image
+- Stable branded title section
+- Four KPI cards
+- Styled tabs and data grids
+- Responsive layout handled by Streamlit columns
