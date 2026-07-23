@@ -174,3 +174,15 @@ The main screen now contains a visible Upload & Import Excel section with:
 - Import counts
 - Import warnings
 - Previous operator-entry preservation confirmation
+
+
+## Version 20 — Compact ERP Header Redesign
+
+- Smaller 68 px logo
+- Compact branded title bar
+- Four aligned KPI cards
+- Single-row import toolbar
+- Upload, template, import and refresh controls together
+- Cleaner navigation spacing
+- Reduced empty space
+- More stable responsive layout
