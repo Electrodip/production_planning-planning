@@ -1,10 +1,13 @@
 
 import io
 import math
+import re
 import sqlite3
+import shutil
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -13,6 +16,20 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
+from reportlab.graphics.barcode import code128
+
+
+
+IST_ZONE = ZoneInfo("Asia/Kolkata")
+
+
+def india_now():
+    """Current timezone-aware India Standard Time."""
+    return datetime.now(IST_ZONE)
+
+
+def india_timestamp_text():
+    return india_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_blank(value):
@@ -182,7 +199,19 @@ class Database:
             supervisor_name TEXT DEFAULT '',
             remarks TEXT DEFAULT '',
             source TEXT DEFAULT 'MANUAL',
+            live_entry_date TEXT,
+            live_entry_time TEXT,
+            entry_timestamp TEXT,
+            last_modified_timestamp TEXT,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS backup_history (
+            backup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            backup_timestamp TEXT NOT NULL,
+            backup_reason TEXT NOT NULL,
+            backup_filename TEXT NOT NULL,
+            backup_size_bytes INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS production_plan (
@@ -230,6 +259,34 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE operator_entries ADD COLUMN plan_id TEXT DEFAULT ''"
             )
+        timestamp_columns = {
+            "live_entry_date": "TEXT",
+            "live_entry_time": "TEXT",
+            "entry_timestamp": "TEXT",
+            "last_modified_timestamp": "TEXT",
+        }
+        for column_name, column_type in timestamp_columns.items():
+            if column_name not in operator_columns:
+                self.conn.execute(
+                    f"ALTER TABLE operator_entries "
+                    f"ADD COLUMN {column_name} {column_type}"
+                )
+
+        # Backfill older entries. created_at may be UTC/server time, so it is
+        # retained for traceability while new IST fields are used going forward.
+        self.conn.execute(
+            """UPDATE operator_entries
+               SET entry_timestamp=COALESCE(entry_timestamp, created_at),
+                   live_entry_date=COALESCE(
+                       live_entry_date, SUBSTR(created_at,1,10)
+                   ),
+                   live_entry_time=COALESCE(
+                       live_entry_time, SUBSTR(created_at,12,8)
+                   )
+               WHERE entry_timestamp IS NULL
+                  OR live_entry_date IS NULL
+                  OR live_entry_time IS NULL"""
+        )
         self.conn.commit()
 
     def clear_master_data(self):
@@ -241,6 +298,101 @@ class Database:
                 "holidays", "weekly_offs", "production_plan"
             ):
                 self.conn.execute(f"DELETE FROM {table}")
+
+    def create_database_backup(self, reason="MANUAL"):
+        """
+        Create a consistent SQLite backup beside the app in Backups/.
+        Returns backup metadata.
+        """
+        backup_dir = self.path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = india_now()
+        safe_reason = re.sub(
+            r"[^A-Za-z0-9_-]+", "_", str(reason or "MANUAL")
+        ).strip("_") or "MANUAL"
+        filename = (
+            f"electro_dip_{timestamp:%Y%m%d_%H%M%S}_{safe_reason}.db"
+        )
+        backup_path = backup_dir / filename
+
+        destination = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(destination)
+        finally:
+            destination.close()
+
+        size_bytes = backup_path.stat().st_size
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO backup_history
+                   (backup_timestamp, backup_reason, backup_filename,
+                    backup_size_bytes)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    str(reason or "MANUAL"),
+                    filename,
+                    size_bytes,
+                ),
+            )
+        return {
+            "path": str(backup_path),
+            "filename": filename,
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": str(reason or "MANUAL"),
+            "size_bytes": size_bytes,
+        }
+
+    def backup_history_rows(self, limit=50):
+        return [
+            dict(row)
+            for row in self.conn.execute(
+                """SELECT * FROM backup_history
+                   ORDER BY backup_id DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        ]
+
+    def database_health(self):
+        backup_row = self.conn.execute(
+            """SELECT backup_timestamp, backup_filename
+               FROM backup_history
+               ORDER BY backup_id DESC LIMIT 1"""
+        ).fetchone()
+        import_like_rows = self.conn.execute(
+            """SELECT COUNT(*) FROM operator_entries
+               WHERE source='OPENING_WIP'"""
+        ).fetchone()[0]
+        return {
+            "Database File": self.path.name,
+            "Database Size MB": round(
+                self.path.stat().st_size / (1024 * 1024), 3
+            ) if self.path.exists() else 0,
+            "Customer Schedules": self.conn.execute(
+                "SELECT COUNT(*) FROM customer_schedules"
+            ).fetchone()[0],
+            "Production Plan Rows": self.conn.execute(
+                "SELECT COUNT(*) FROM production_plan"
+            ).fetchone()[0],
+            "Operator Entries": self.conn.execute(
+                "SELECT COUNT(*) FROM operator_entries"
+            ).fetchone()[0],
+            "Opening WIP Entries": import_like_rows,
+            "Process BOM Rows": self.conn.execute(
+                "SELECT COUNT(*) FROM process_bom"
+            ).fetchone()[0],
+            "Machine Recommendations": self.conn.execute(
+                "SELECT COUNT(*) FROM machine_recommendations"
+            ).fetchone()[0],
+            "Last Backup Time": (
+                backup_row["backup_timestamp"] if backup_row else "Never"
+            ),
+            "Last Backup File": (
+                backup_row["backup_filename"] if backup_row else ""
+            ),
+            "Current IST": india_timestamp_text(),
+        }
 
     def clear_plan(self):
         with self.conn:
@@ -748,14 +900,19 @@ class Database:
             self.validate_sequence_entry(plan_id, actual)
 
         good = max(actual - rejected, 0)
+        captured_ist = india_now()
+        captured_timestamp = captured_ist.strftime("%Y-%m-%d %H:%M:%S")
         with self.conn:
             self.conn.execute(
                 """INSERT INTO operator_entries
                 (plan_id, entry_date, schedule_id, customer_name, part_name,
                  process_sequence, operation_name, machine_name, shift_name,
                  planned_qty, actual_qty, rejected_qty, good_qty, status,
-                 operator_name, supervisor_name, remarks, source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?)""",
+                 operator_name, supervisor_name, remarks, source,
+                 live_entry_date, live_entry_time, entry_timestamp,
+                 last_modified_timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'MANUAL', ?, ?, ?, NULL, ?)""",
                 (
                     str(plan_id or ""),
                     parse_date(entry_date).isoformat(), str(schedule_id or ""),
@@ -765,7 +922,10 @@ class Database:
                     float(planned_qty or 0), actual, rejected, good,
                     str(status or ""), str(operator_name or ""),
                     str(supervisor_name or ""), str(remarks or ""),
-                    datetime.now().isoformat(sep=" ", timespec="seconds")
+                    captured_ist.strftime("%Y-%m-%d"),
+                    captured_ist.strftime("%H:%M:%S"),
+                    captured_timestamp,
+                    captured_timestamp,
                 )
             )
         return good
@@ -833,7 +993,7 @@ class Database:
                        operator_name=?,
                        supervisor_name=?,
                        remarks=?,
-                       created_at=?
+                       last_modified_timestamp=?
                    WHERE entry_id=?""",
                 (
                     actual,
@@ -843,9 +1003,7 @@ class Database:
                     str(operator_name or ""),
                     str(supervisor_name or ""),
                     str(remarks or ""),
-                    datetime.now().isoformat(
-                        sep=" ", timespec="seconds"
-                    ),
+                    india_timestamp_text(),
                     int(entry_id),
                 ),
             )
@@ -872,7 +1030,8 @@ class Database:
     def operator_entries(self):
         return self.conn.execute(
             """SELECT * FROM operator_entries
-               ORDER BY entry_date DESC, entry_id DESC"""
+               ORDER BY COALESCE(entry_timestamp, created_at) DESC,
+                        entry_id DESC"""
         ).fetchall()
 
     def bom_rows(self):
@@ -1843,19 +2002,27 @@ class Database:
                 c.drawString(x+label_w+1.5*mm, y+h/2-2, str(value or ""))
 
             info_y = page_h - 42*mm
+            shift_values = sorted({
+                str(row.get("shift_name") or "")
+                for row in group_rows
+                if row.get("shift_name")
+            })
+            shift_text = ", ".join(shift_values)
             box(8*mm, info_y, 90*mm, 9*mm, "Machine", machine, colors.HexColor("#D9EAF7"))
-            box(101*mm, info_y, 55*mm, 9*mm, "Shift", "", colors.HexColor("#E4DFEC"))
+            box(101*mm, info_y, 55*mm, 9*mm, "Shift", shift_text, colors.HexColor("#E4DFEC"))
             box(159*mm, info_y, 62*mm, 9*mm, "Operator", "", colors.HexColor("#E2F0D9"))
             box(224*mm, info_y, 65*mm, 9*mm, "Supervisor", "", colors.HexColor("#FFF2CC"))
 
             headers = [
-                "Plan ID", "Sr", "Start", "End", "Customer", "Part No.",
-                "Operation", "Plan Qty", "Actual Qty", "Rejected Qty",
-                "Priority", "Status", "Remarks"
+                "Barcode / Plan ID", "Sr", "Start", "End", "Customer",
+                "Part No.", "Operation", "Plan Qty", "Actual Qty",
+                "Rejected Qty", "Priority", "Status", "Remarks"
             ]
-            widths = [30, 7, 14, 14, 27, 21, 36, 16, 18, 20, 15, 16, 29]
+            # Fixed widths are tuned for A4 landscape and match the approved
+            # slip layout. The first column contains both barcode and Plan ID.
+            widths = [48, 7, 13, 13, 25, 20, 34, 15, 17, 18, 14, 15, 22]
             widths = [w*mm for w in widths]
-            row_h = 8.2*mm
+            row_h = 10.5*mm
             table_x = 8*mm
             table_y = info_y - 6*mm - row_h
 
@@ -1905,21 +2072,42 @@ class Database:
                     c.setFillColor(fill)
                     c.setStrokeColor(colors.HexColor("#7F8C8D"))
                     c.rect(x, y, width, row_h, stroke=1, fill=1)
-                    c.setFillColor(colors.HexColor("#1F1F1F"))
-                    c.setFont(
-                        "Helvetica-Bold"
-                        if col_idx in (0, 4, 5, 6, 7)
-                        else "Helvetica",
-                        5.8
-                    )
-                    text = str(value or "")
-                    max_chars = 26 if col_idx == 0 else 22
-                    if len(text) > max_chars:
-                        text = text[:max_chars-2] + ".."
-                    if col_idx in (0, 4, 6, 12):
-                        c.drawString(x+1.2*mm, y+2.4*mm, text)
+
+                    if col_idx == 0:
+                        # Real Code 128 barcode immediately before Plan ID.
+                        plan_id = str(value or "")
+                        barcode = code128.Code128(
+                            plan_id,
+                            barHeight=5.6*mm,
+                            barWidth=0.22,
+                            humanReadable=False,
+                        )
+                        barcode_x = x + 1.0*mm
+                        barcode_y = y + 2.2*mm
+                        c.setFillColor(colors.black)
+                        barcode.drawOn(c, barcode_x, barcode_y)
+
+                        # Visible Plan ID remains beside the barcode as a
+                        # manual fallback when a scanner is unavailable.
+                        c.setFillColor(colors.HexColor("#1F1F1F"))
+                        c.setFont("Helvetica-Bold", 4.4)
+                        c.drawString(x + 31.5*mm, y + 4.4*mm, plan_id)
                     else:
-                        c.drawCentredString(x+width/2, y+2.4*mm, text)
+                        c.setFillColor(colors.HexColor("#1F1F1F"))
+                        c.setFont(
+                            "Helvetica-Bold"
+                            if col_idx in (4, 5, 6, 7)
+                            else "Helvetica",
+                            5.8,
+                        )
+                        text = str(value or "")
+                        max_chars = 22
+                        if len(text) > max_chars:
+                            text = text[:max_chars-2] + ".."
+                        if col_idx in (4, 6, 12):
+                            c.drawString(x+1.2*mm, y+3.4*mm, text)
+                        else:
+                            c.drawCentredString(x+width/2, y+3.4*mm, text)
                     x += width
 
             totals_y = table_y - (max(len(shown), 1)+1)*row_h - 4*mm

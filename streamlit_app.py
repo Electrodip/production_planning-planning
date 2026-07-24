@@ -4,6 +4,7 @@ import tempfile
 import hashlib
 import base64
 from datetime import datetime, date, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -864,8 +865,12 @@ with st.container(border=True):
 
         if import_clicked:
             try:
+                backup_info = db.create_database_backup(
+                    reason="BEFORE_IMPORT"
+                )
                 uploaded_excel.seek(0)
                 import_report = db.import_workbook(uploaded_excel)
+                import_report["backup_created"] = backup_info
                 st.session_state["latest_import_report"] = import_report
                 st.success(
                     "Excel imported successfully. "
@@ -911,6 +916,10 @@ tabs = st.tabs([
 ])
 
 with tabs[0]:
+    live_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    st.info(
+        f"Live India Time: {live_ist:%d-%b-%Y %H:%M:%S} IST"
+    )
     entries = db.conn.execute("SELECT COUNT(*) FROM operator_entries").fetchone()[0]
     wip_total = sum(r["wip_after_process"] for r in db.wip_rows())
     dispatched = db.conn.execute(
@@ -932,6 +941,32 @@ with tabs[0]:
         "Dispatch quantity is allocated FIFO to the earliest due schedule. "
         "Minimum stock is generated once, after customer schedules."
     )
+
+
+    with st.expander("Database Health & Backups"):
+        health = db.database_health()
+        health_df = pd.DataFrame(
+            [{"Check": key, "Value": value} for key, value in health.items()]
+        )
+        st.dataframe(health_df, hide_index=True, use_container_width=True)
+
+        manual_backup_col, history_col = st.columns([1, 2])
+        with manual_backup_col:
+            if st.button("Create Manual Backup", use_container_width=True):
+                backup = db.create_database_backup("MANUAL")
+                st.success(
+                    f"Backup created: {backup['filename']} "
+                    f"at {backup['timestamp']} IST"
+                )
+        with history_col:
+            backup_history = pd.DataFrame(db.backup_history_rows())
+            if not backup_history.empty:
+                st.dataframe(
+                    backup_history,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=220,
+                )
 
 with tabs[1]:
     st.subheader("Production Plan")
@@ -1263,7 +1298,8 @@ with tabs[3]:
                 "operation_name", "machine_name", "shift_name",
                 "planned_qty", "actual_qty", "rejected_qty",
                 "operator_name", "supervisor_name", "status",
-                "created_at",
+                "live_entry_date", "live_entry_time",
+                "entry_timestamp", "last_modified_timestamp",
             ]
             visible = [c for c in preferred if c in today_entries.columns]
             st.dataframe(
@@ -1359,6 +1395,18 @@ with tabs[9]:
     entries = [dict(r) for r in db.operator_entries()]
     entries_df = pd.DataFrame(entries)
 
+    if not entries_df.empty:
+        previous_export = entries_df.to_excel(
+            index=False, engine="openpyxl"
+        ) if False else None
+        csv_bytes = entries_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Previous Entries CSV",
+            data=csv_bytes,
+            file_name="Electro_Dip_Previous_Entries.csv",
+            mime="text/csv",
+        )
+
     if entries_df.empty:
         st.info("No saved operator entries.")
     else:
@@ -1415,7 +1463,8 @@ with tabs[9]:
             "operation_name", "machine_name", "shift_name",
             "planned_qty", "actual_qty", "rejected_qty", "good_qty",
             "operator_name", "supervisor_name", "status",
-            "remarks", "created_at",
+            "remarks", "live_entry_date", "live_entry_time",
+            "entry_timestamp", "last_modified_timestamp",
         ]
         visible_columns = [
             column for column in display_columns
@@ -1449,7 +1498,10 @@ with tabs[9]:
                     f"Part: {selected_entry['part_name']} | "
                     f"Operation: {selected_entry['process_sequence']} - "
                     f"{selected_entry['operation_name']} | "
-                    f"Machine: {selected_entry.get('machine_name') or '-'}"
+                    f"Machine: {selected_entry.get('machine_name') or '-'} | "
+                    f"Live Entry: {selected_entry.get('entry_timestamp') or '-'} IST | "
+                    f"Last Modified: "
+                    f"{selected_entry.get('last_modified_timestamp') or 'Never'}"
                 )
 
                 edit_col1, edit_col2 = st.columns(2)
@@ -1605,6 +1657,10 @@ with tabs[11]:
         if confirm != "CLEAR ALL ENTRIES":
             st.warning("Confirmation text does not match.")
         else:
+            backup = db.create_database_backup("BEFORE_CLEAR_ALL")
             count = db.clear_previous_entries()
             st.session_state.pop("wip_export", None)
-            st.success(f"{count} previous entries cleared. Production plan also cleared.")
+            st.success(
+                f"{count} previous entries cleared. Production plan also "
+                f"cleared. Backup created: {backup['filename']}."
+            )

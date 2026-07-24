@@ -217,3 +217,28 @@ Checks include:
 
 The diagnostic report shows severity, sheet, row, column, reason and value.
 Critical errors block import. Warnings do not block import.
+
+
+## Version 24 — Professional Timestamp and Backup Release
+
+- Live operator-entry timestamp uses Asia/Kolkata (IST).
+- Separate Live Entry Date and Live Entry Time columns.
+- Original Entry Timestamp is preserved during edits.
+- Last Modified Timestamp is updated only when an entry is edited.
+- Automatic database backup before Excel import.
+- Automatic database backup before Clear Previous Entries.
+- Manual database backup and backup history in Dashboard.
+- Database Health section.
+- Previous entries CSV export.
+
+
+## Version 25 - Approved Barcode Machine Slip
+
+- Retains all V24 Professional IST functions.
+- Approved A4 landscape ELECTRO-DIP machine daily production slip.
+- Slip No. and Production Date in the header.
+- Real Code 128 barcode in every row immediately before the visible Plan ID.
+- Machine and Shift populated automatically from the production plan.
+- Multiple transportation lots appear on one machine/date slip.
+- Actual Qty and Rejected Qty writing cells remain color coded.
+- Totals, utilization, remarks, status and signatures retained.
